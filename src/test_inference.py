@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm.auto import tqdm
 
 from .prepare_data import _discover_mt, _parallel_rows
 from .prompts import TRANSLATION_TARGET_MARKER, translation_instruction
@@ -91,7 +92,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     counts = defaultdict(int)
-    with ExitStack() as stack:
+    with ExitStack() as stack, tqdm(desc="Generating translations", unit="sample") as progress:
         writers = {}
 
         def writer_for(row: dict):
@@ -144,9 +145,11 @@ def main() -> None:
                     "pred": prediction.strip(),
                 })
                 counts[direction] += 1
-            print(
-                "Generated " + ", ".join(f"{key}={value}" for key, value in sorted(counts.items())),
-                flush=True,
+            progress.update(len(row_batch))
+            progress.set_postfix_str(
+                ", ".join(
+                    f"{key}={value}" for key, value in sorted(counts.items())
+                )
             )
     for direction, count in sorted(counts.items()):
         print(f"Saved {count} rows to {(output_dir / f'{direction}.csv').resolve()}")
