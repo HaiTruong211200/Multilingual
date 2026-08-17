@@ -83,14 +83,14 @@ class ComponentLoggingTrainer(Trainer):
                 value = total / count
                 logs[name] = value
                 component_logs[name] = value
-            if component_logs:
-                self.accelerator.print(
-                    "Loss components | "
-                    + " | ".join(
-                        f"{key}={value:.6f}"
-                        for key, value in component_logs.items()
-                    )
-                )
+            # if component_logs:
+            #     self.accelerator.print(
+            #         "Loss components | "
+            #         + " | ".join(
+            #             f"{key}={value:.6f}"
+            #             for key, value in component_logs.items()
+            #         )
+            #     )
             self._sums[mode].clear()
             self._counts[mode] = 0
         if start_time is None:
@@ -113,9 +113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--languages", default="en,km,my,th,vi")
     parser.add_argument("--bactrian_validation_ratio", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--alignment_max_length", type=int, default=128)
-    parser.add_argument("--contrastive_weight", type=float, default=0.1)
-    parser.add_argument("--ot_weight", type=float, default=0.05)
+    parser.add_argument("--contrastive_weight", type=float, default=0.0)
+    parser.add_argument("--ot_weight", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--align_layer", type=int, default=-1)
     parser.add_argument("--attention_mass_weight", type=float, default=0.5)
@@ -141,6 +140,20 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated linear module names.",
     )
     parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--eval_steps", type=int, default=500)
+    parser.add_argument(
+        "--save_strategy", choices=["steps", "epoch"], default="epoch"
+    )
+    parser.add_argument(
+        "--eval_strategy", choices=["steps", "epoch"], default="epoch"
+    )
+    parser.add_argument(
+        "--lr_scheduler_type",
+        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
+        default="cosine",
+    )
+    parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument(
         "--report_to", choices=["none", "tensorboard"], default="tensorboard"
     )
@@ -183,7 +196,7 @@ def build_stage(args, tokenizer):
             trust_remote_code=args.trust_remote_code,
         )
         model.lm = apply_lora(model.lm, args)
-        collator = MultilingualDataCollator(tokenizer, args.max_length, args.alignment_max_length)
+        collator = MultilingualDataCollator(tokenizer)
         return dataset, model, collator
 
     dataset = load_instruction_dataset(
@@ -199,6 +212,18 @@ def build_stage(args, tokenizer):
 
 def main() -> None:
     args = parse_args()
+    if args.logging_steps <= 0 or args.save_steps <= 0 or args.eval_steps <= 0:
+        raise ValueError("logging_steps, save_steps, and eval_steps must be positive")
+    if args.warmup_steps < 0:
+        raise ValueError("warmup_steps cannot be negative")
+    if args.save_strategy != args.eval_strategy:
+        raise ValueError(
+            "save_strategy and eval_strategy must match when load_best_model_at_end=True"
+        )
+    if args.save_strategy == "steps" and args.save_steps % args.eval_steps != 0:
+        raise ValueError(
+            "save_steps must be a multiple of eval_steps when using step strategies"
+        )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -211,6 +236,11 @@ def main() -> None:
         args.bf16, args.fp16, args.batch_size,
         args.gradient_accumulation_steps, args.epochs, args.learning_rate,
     )
+    LOGGER.info(
+        "Schedule=%s | warmup_steps=%d | logging_steps=%d | save=%s/%d | eval=%s/%d",
+        args.lr_scheduler_type, args.warmup_steps, args.logging_steps,
+        args.save_strategy, args.save_steps, args.eval_strategy, args.eval_steps,
+    )
     if args.stage == "alignment":
         LOGGER.info(
             "Data MT=%s | pairs=%s | direction=%s | loss=NTP + %.4g*CL + %.4g*OT",
@@ -218,8 +248,8 @@ def main() -> None:
             args.contrastive_weight, args.ot_weight,
         )
         LOGGER.info(
-            "Alignment layer=%d | attention_mass_weight=%g | Sinkhorn eps=%g iterations=%d",
-            args.align_layer, args.attention_mass_weight,
+            "Alignment layer=%d | contrastive_temperature=%g | attention_mass_weight=%g | Sinkhorn eps=%g iterations=%d",
+            args.align_layer, args.temperature, args.attention_mass_weight,
             args.sinkhorn_epsilon, args.sinkhorn_iterations,
         )
     else:
@@ -269,12 +299,16 @@ def main() -> None:
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        eval_strategy=args.eval_strategy,
+        eval_steps=args.eval_steps,
+        save_strategy=args.save_strategy,
+        save_steps=args.save_steps,
         logging_strategy="steps",
         logging_steps=args.logging_steps,
         logging_first_step=True,
         logging_dir=f"{args.output_dir}/runs",
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
         bf16=args.bf16,
         fp16=args.fp16,
         remove_unused_columns=False,

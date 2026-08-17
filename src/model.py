@@ -35,8 +35,8 @@ class MultilingualAlignmentModel(nn.Module):
     def __init__(
         self,
         model_name_or_path: str,
-        contrastive_weight: float = 0.1,
-        ot_weight: float = 0.05,
+        contrastive_weight: float = 0.0,
+        ot_weight: float = 0.0,
         temperature: float = 0.07,
         align_layer: int = -1,
         attention_mass_weight: float = 0.5,
@@ -141,51 +141,64 @@ class MultilingualAlignmentModel(nn.Module):
         target_end_positions: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        compute_contrastive = self.contrastive_weight != 0.0
+        compute_ot = self.ot_weight != 0.0
+        compute_alignment = compute_contrastive or compute_ot
         output = self.lm(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
-            output_hidden_states=True,
-            output_attentions=True,
+            output_hidden_states=compute_alignment,
+            output_attentions=compute_ot,
             return_dict=True,
         )
         if source_start_positions is None or target_start_positions is None:
             return output
 
-        contrastive_hidden = output.hidden_states[self.align_layer]
-        final_hidden = output.hidden_states[-1]
-        positions = torch.arange(final_hidden.size(1), device=final_hidden.device).unsqueeze(0)
-        source_mask = (positions >= source_start_positions[:, None]) & (positions < source_end_positions[:, None])
-        target_mask = (positions >= target_start_positions[:, None]) & (positions < target_end_positions[:, None])
-
-        # hidden_states[0] is the embedding output, while attentions[0] belongs
-        # to transformer layer 1. Negative indices naturally select from the end.
-        attention_layer = self.align_layer if self.align_layer < 0 else max(self.align_layer - 1, 0)
-        attention = output.attentions[attention_layer].mean(dim=1)  # [B, query, key]
-
-        # Token salience is the attention received from target queries. This gives
-        # source mass from target->source attention and target mass from target
-        # self-attention, all at the layer used for contrastive alignment.
-        received_attention = (
-            attention.float() * target_mask.unsqueeze(-1)
-        ).sum(dim=1)
-        source_scores = received_attention * source_mask
-        target_scores = received_attention * target_mask
-        source_mass = self._mixed_mass(source_scores, source_mask)
-        target_mass = self._mixed_mass(target_scores, target_mask)
-        contrastive = self._contrastive(
-            masked_mean(contrastive_hidden, source_mask),
-            masked_mean(contrastive_hidden, target_mask),
-        )
-        ot = self._sinkhorn_ot(
-            final_hidden,
-            final_hidden,
-            source_mask,
-            target_mask,
-            source_mass,
-            target_mass,
-        )
         ntp_loss = output.loss
+        contrastive = ntp_loss.new_zeros(())
+        ot = ntp_loss.new_zeros(())
+
+        if compute_alignment:
+            final_hidden = output.hidden_states[-1]
+            positions = torch.arange(
+                final_hidden.size(1), device=final_hidden.device
+            ).unsqueeze(0)
+            source_mask = (positions >= source_start_positions[:, None]) & (
+                positions < source_end_positions[:, None]
+            )
+            target_mask = (positions >= target_start_positions[:, None]) & (
+                positions < target_end_positions[:, None]
+            )
+
+            if compute_contrastive:
+                contrastive_hidden = output.hidden_states[self.align_layer]
+                contrastive = self._contrastive(
+                    masked_mean(contrastive_hidden, source_mask),
+                    masked_mean(contrastive_hidden, target_mask),
+                )
+
+            if compute_ot:
+                # hidden_states[0] is embeddings; attentions[0] is layer 1.
+                attention_layer = (
+                    self.align_layer
+                    if self.align_layer < 0
+                    else max(self.align_layer - 1, 0)
+                )
+                attention = output.attentions[attention_layer].mean(dim=1)
+                received_attention = (
+                    attention.float() * target_mask.unsqueeze(-1)
+                ).sum(dim=1)
+                source_mass = self._mixed_mass(
+                    received_attention * source_mask, source_mask
+                )
+                target_mass = self._mixed_mass(
+                    received_attention * target_mask, target_mask
+                )
+                ot = self._sinkhorn_ot(
+                    final_hidden, final_hidden, source_mask, target_mask,
+                    source_mass, target_mass,
+                )
         # Usually all three losses are already colocated. Explicit movement is
         # required for model/tensor parallel layouts where alignment hidden
         # states and the LM head may live on different devices.

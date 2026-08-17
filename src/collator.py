@@ -18,37 +18,43 @@ from .prompts import (
 
 @dataclass
 class MultilingualDataCollator:
+    """Tạo batch Stage 1 cho NTP và hai objective alignment.
+
+    Mỗi sample có dạng:
+    [instruction] [source] [translation marker] [target] [EOS]
+
+    Ngoài input/label chuẩn của causal LM, collator trả vị trí đầu/cuối của
+    source và target để model cắt đúng hai vùng từ cùng một hidden state.
+    """
+
     tokenizer: PreTrainedTokenizerBase
-    max_length: int = 512
-    alignment_max_length: int = 128
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # ------------------------------------------------------------------
+        # Block 1: Lấy text nguồn/đích từ các sample đã được prepare_data.
+        # ------------------------------------------------------------------
         sources = [str(item["source"]) for item in features]
         targets = [str(item["target"]) for item in features]
 
-        # Build one causal sequence and retain the exact source/target spans in it.
+        # ------------------------------------------------------------------
+        # Block 2: Tokenize từng thành phần và ghép thành một causal sequence.
+        # Tokenize riêng từng phần giúp biết chính xác index của source/target.
+        # ------------------------------------------------------------------
         lm_ids, lm_labels, spans = [], [], []
         eos_id = self.tokenizer.eos_token_id
         for item, source, target in zip(features, sources, targets):
+            # Instruction chứa hướng dịch; marker phân cách source với target.
             instruction = translation_instruction(item["source_lang"], item["target_lang"])
             instruction_ids = self.tokenizer(instruction, add_special_tokens=False)["input_ids"]
             marker_ids = self.tokenizer(TRANSLATION_TARGET_MARKER, add_special_tokens=False)["input_ids"]
-            source_ids = self.tokenizer(source, add_special_tokens=False)["input_ids"][: self.alignment_max_length]
-            target_ids = self.tokenizer(target, add_special_tokens=False)["input_ids"][: self.alignment_max_length]
+            source_ids = self.tokenizer(source, add_special_tokens=False)["input_ids"]
+            target_ids = self.tokenizer(target, add_special_tokens=False)["input_ids"]
 
-            fixed = len(instruction_ids) + len(marker_ids) + (1 if eos_id is not None else 0)
-            token_budget = self.max_length - fixed
-            if token_budget < 2:
-                raise ValueError("max_length is too small for the instruction and two aligned spans")
-            # Trim the longer span until both fit, retaining at least one token each.
-            while len(source_ids) + len(target_ids) > token_budget:
-                if len(source_ids) >= len(target_ids) and len(source_ids) > 1:
-                    source_ids.pop()
-                elif len(target_ids) > 1:
-                    target_ids.pop()
-                else:
-                    break
-
+            # ------------------------------------------------------------------
+            # Block 3: Xác định các interval [start, end). Stage 1 không truncate
+            # source/target; toàn bộ cặp câu được giữ nguyên cho NTP/CL/OT.
+            # Các index này trỏ trực tiếp vào sequence được đưa qua model.
+            # ------------------------------------------------------------------
             source_start = len(instruction_ids)
             source_end = source_start + len(source_ids)
             target_start = source_end + len(marker_ids)
@@ -56,11 +62,30 @@ class MultilingualDataCollator:
             ids = instruction_ids + source_ids + marker_ids + target_ids
             if eos_id is not None:
                 ids.append(eos_id)
+
+            # Không âm thầm cắt dữ liệu. Nếu model công bố context window hữu
+            # hạn và sample vượt giới hạn, báo lỗi để người dùng lọc dữ liệu hoặc
+            # chọn model có context dài hơn.
+            model_limit = self.tokenizer.model_max_length
+            if model_limit < 10**9 and len(ids) > model_limit:
+                raise ValueError(
+                    f"Translation sample has {len(ids)} tokens, exceeding "
+                    f"model_max_length={model_limit}."
+                )
+
+            # ------------------------------------------------------------------
+            # Block 4: Response-only NTP. Instruction, source và marker nhận
+            # label=-100 nên CrossEntropyLoss bỏ qua; target và EOS được học.
+            # ------------------------------------------------------------------
             labels = ([-100] * target_start) + ids[target_start:]
             lm_ids.append(ids)
             lm_labels.append(labels)
             spans.append((source_start, source_end, target_start, target_end))
 
+        # ------------------------------------------------------------------
+        # Block 5: Right padding theo sequence dài nhất trong batch. PAD có attention_mask=0 và
+        # labels=-100, vì vậy không tham gia attention hợp lệ hay NTP loss.
+        # ------------------------------------------------------------------
         batch_size, width = len(lm_ids), max(map(len, lm_ids))
         pad_id = self.tokenizer.pad_token_id
         input_ids = torch.full((batch_size, width), pad_id, dtype=torch.long)
@@ -72,6 +97,10 @@ class MultilingualDataCollator:
             attention_mask[i, :length] = 1
             labels[i, :length] = torch.tensor(row_labels)
 
+        # ------------------------------------------------------------------
+        # Block 6: Batch đầu ra. Bốn position tensors được model chuyển thành
+        # source_mask/target_mask để mean pooling, contrastive và OT.
+        # ------------------------------------------------------------------
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -85,18 +114,25 @@ class MultilingualDataCollator:
 
 @dataclass
 class InstructionDataCollator:
-    """Stage-2 collator whose NTP labels cover only the assistant response."""
+    """Tạo batch Stage 2 với NTP loss chỉ áp dụng lên response/output."""
 
     tokenizer: PreTrainedTokenizerBase
     max_length: int = 1024
 
     def _prompt_ids(self, instruction: str, input_text: str) -> list[int]:
+        # ------------------------------------------------------------------
+        # Block 1: Dựng plain-text prompt cho base model. Không dùng chat
+        # template hay system/user/assistant special tokens.
+        # ------------------------------------------------------------------
         user = instruction_user_prompt(instruction, input_text)
         return self.tokenizer(
             instruction_prompt(user), add_special_tokens=True
         )["input_ids"]
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # ------------------------------------------------------------------
+        # Block 2: Tokenize prompt và response riêng để xác định ranh giới label.
+        # ------------------------------------------------------------------
         rows = []
         eos_id = self.tokenizer.eos_token_id
         for row in features:
@@ -108,12 +144,23 @@ class InstructionDataCollator:
             )["input_ids"]
             if eos_id is not None:
                 response_ids.append(eos_id)
+
+            # ------------------------------------------------------------------
+            # Block 3: Ưu tiên giữ response vì đây là vùng có supervision.
+            # Response được cắt theo max_length trước; prompt chỉ dùng phần
+            # ngân sách còn lại và giữ phần cuối gần response nhất.
+            # ------------------------------------------------------------------
             response_ids = response_ids[: self.max_length]
             prompt_budget = max(0, self.max_length - len(response_ids))
             prompt_ids = prompt_ids[-prompt_budget:] if prompt_budget else []
             ids = prompt_ids + response_ids
+
+            # Prompt nhận -100; chỉ response và EOS được tính NTP loss.
             rows.append((ids, [-100] * len(prompt_ids) + response_ids))
 
+        # ------------------------------------------------------------------
+        # Block 4: Right padding giống Stage 1. Padding labels luôn là -100.
+        # ------------------------------------------------------------------
         width = max(len(ids) for ids, _ in rows)
         input_ids = torch.full(
             (len(rows), width), self.tokenizer.pad_token_id, dtype=torch.long
@@ -125,4 +172,5 @@ class InstructionDataCollator:
             input_ids[index, :length] = torch.tensor(ids)
             attention_mask[index, :length] = 1
             labels[index, :length] = torch.tensor(row_labels)
+        # Stage 2 không cần span positions vì không tính contrastive/OT.
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}

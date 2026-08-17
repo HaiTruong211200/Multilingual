@@ -36,6 +36,12 @@ ARGS=(
   --lora_dropout "${LORA_DROPOUT:-0.05}"
   --lora_target_modules "${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj}"
   --logging_steps "${LOGGING_STEPS:-10}"
+  --save_steps "${SAVE_STEPS:-500}"
+  --eval_steps "${EVAL_STEPS:-500}"
+  --save_strategy "${SAVE_STRATEGY:-epoch}"
+  --eval_strategy "${EVAL_STRATEGY:-epoch}"
+  --lr_scheduler_type "${LR_SCHEDULER_TYPE:-cosine}"
+  --warmup_steps "${WARMUP_STEPS:-0}"
   --report_to "${REPORT_TO:-tensorboard}"
 )
 

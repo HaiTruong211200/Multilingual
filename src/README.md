@@ -4,6 +4,10 @@ The objective is:
 
 `L = L_NTP + contrastive_weight * L_InfoNCE + ot_weight * L_Sinkhorn`
 
+Both alignment weights default to `0.0`. Contrastive or OT computation is skipped
+entirely when its corresponding weight is zero, avoiding hidden-state/attention
+overhead. Set `CONTRASTIVE_WEIGHT` and/or `OT_WEIGHT` to enable them.
+
 By default all `data/MT/*/train.*.json` and `data/MT/*/valid.*.json` files are loaded.
 The repository's JSONL schema is supported directly:
 
@@ -27,8 +31,8 @@ python -m src.train --stage alignment \
 -> Vietnamese, and `both` adds both examples. A batch size of at least 2 is
 recommended because in-batch negatives are used by InfoNCE.
 
-OT is quadratic in `alignment_max_length`; keep it much smaller than `max_length`.
-The implementation uses the causal LM's shared hidden space and excludes padding
+OT is quadratic in the retained source/target token lengths. The implementation
+uses the causal LM's shared hidden space and excludes padding
 tokens from mean pooling and transport marginals.
 
 The collator records `source_start_positions`, `source_end_positions`,
@@ -60,6 +64,13 @@ Both `.sh` stage scripts use LoRA by default (`r=16`, `alpha=32`, dropout `0.05`
 on `q_proj,k_proj,v_proj,o_proj`. The adapter is merged when a stage finishes so
 the exported checkpoint is a normal Hugging Face model that the next stage can
 load directly.
+
+Stage 1 contrastive temperature is configured with
+`CONTRASTIVE_TEMPERATURE` (default `0.07`).
+Training cadence is configurable with `LOGGING_STEPS`, `SAVE_STEPS`,
+`EVAL_STEPS`, `SAVE_STRATEGY`, `EVAL_STRATEGY`, `LR_SCHEDULER_TYPE`, and
+`WARMUP_STEPS`. Save/eval strategies must match; for step strategies,
+`SAVE_STEPS` must be a multiple of `EVAL_STEPS`.
 
 Training logs the selected stage, data sources/languages, processed dataset sizes
 and a truncated processed sample, LoRA/trainable parameter statistics, and every

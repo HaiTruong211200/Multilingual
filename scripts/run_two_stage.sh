@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STAGE1_OUTPUT="${STAGE1_OUTPUT:-outputs/stage1-multilingual-alignment}"
 STAGE2_OUTPUT="${STAGE2_OUTPUT:-outputs/stage2-instruction-ft}"
 
-echo "========== Stage 1: NTP + Contrastive + OT =========="
+echo "========== Stage 1: NTP with optional Contrastive/OT =========="
 MODEL_NAME_OR_PATH="${BASE_MODEL:-Qwen/Qwen2.5-0.5B}" \
 OUTPUT_DIR="$STAGE1_OUTPUT" \
 LANGUAGE_PAIRS="${TRANSLATION_PAIRS:-all}" \
