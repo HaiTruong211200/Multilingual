@@ -5,6 +5,7 @@ import argparse
 import logging
 from collections import defaultdict
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from .collator import InstructionDataCollator, MultilingualDataCollator
@@ -53,19 +54,43 @@ class ComponentLoggingTrainer(Trainer):
                 value = outputs.get(key)
                 if value is not None:
                     self._sums[mode][key] += float(value.float().mean())
-                    outputs.pop(key, None)
         else:
             self._sums[mode]["ntp_loss"] += float(loss.detach().float().mean())
         self._counts[mode] += 1
-        return (loss, outputs) if return_outputs else loss
+        if not return_outputs:
+            return loss
+        if self.stage == "alignment":
+            # ModelOutput is immutable with respect to pop/delete. Return a clean
+            # standard output instead of mutating the alignment output; this also
+            # prevents scalar logging fields from being interpreted as logits.
+            outputs = CausalLMOutputWithPast(
+                loss=loss,
+                logits=outputs.logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+        return loss, outputs
 
     def log(self, logs, start_time=None):
         mode = "eval" if any(key.startswith("eval_") for key in logs) else "train"
         count = self._counts[mode]
         if count:
             prefix = "eval" if mode == "eval" else "train"
+            component_logs = {}
             for key, total in self._sums[mode].items():
-                logs[f"{prefix}/{key}"] = total / count
+                name = f"{prefix}/{key}"
+                value = total / count
+                logs[name] = value
+                component_logs[name] = value
+            if component_logs:
+                self.accelerator.print(
+                    "Loss components | "
+                    + " | ".join(
+                        f"{key}={value:.6f}"
+                        for key, value in component_logs.items()
+                    )
+                )
             self._sums[mode].clear()
             self._counts[mode] = 0
         if start_time is None:

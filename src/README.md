@@ -104,3 +104,18 @@ INSTRUCTION_LANGUAGES=vi,th,en \
 
 To run only stage 2 from another checkpoint, set `MODEL_NAME_OR_PATH` before
 calling `run_stage2_instruction_ft.sh`.
+
+Test translation inference. Each translation direction is exported to its own
+UTF-8 CSV (`vi-en.csv`, `en-vi.csv`, etc.) with exactly `src,ref,pred`:
+
+```bash
+MODEL_NAME_OR_PATH=outputs/stage2-instruction-ft \
+LANGUAGE_PAIRS=vi-en,th-en \
+DIRECTION=forward \
+OUTPUT_DIR=outputs/test_predictions \
+./scripts/run_test_inference.sh
+```
+
+For a quick subset, set `MAX_SAMPLES=100` to keep up to 100 rows per translation
+direction. The notebook contains a separate
+three-step LoRA mini-training cell for checking backward and component logging.

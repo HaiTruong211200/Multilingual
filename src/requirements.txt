@@ -5,3 +5,4 @@ accelerate>=0.28
 ijson>=3.2
 peft>=0.12
 tensorboard>=2.14
+pandas>=2.0
