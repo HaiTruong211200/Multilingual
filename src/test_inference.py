@@ -32,7 +32,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_prompt_ids(tokenizer, row: dict, max_length: int) -> list[int]:
-    prefix = translation_instruction(row["source_lang"], row["target_lang"])
+    # Fix one template during evaluation so predictions are reproducible.
+    prefix = translation_instruction(
+        row["source_lang"], row["target_lang"], template_index=0
+    )
     prefix_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
     marker_ids = tokenizer(TRANSLATION_TARGET_MARKER, add_special_tokens=False)["input_ids"]
     source_ids = tokenizer(row["source"], add_special_tokens=False)["input_ids"]
