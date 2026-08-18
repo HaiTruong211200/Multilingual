@@ -19,6 +19,7 @@ ARGS=(
   --language_pairs "${LANGUAGE_PAIRS:-all}"
   --output_dir "$OUTPUT_DIR"
   --direction "$DIRECTION"
+  --prompt_format "${PROMPT_FORMAT:-plain}"
   --align_layer "${ALIGN_LAYER:--1}"
   --contrastive_weight "${CONTRASTIVE_WEIGHT:-0.0}"
   --temperature "${CONTRASTIVE_TEMPERATURE:-0.07}"
@@ -47,6 +48,12 @@ ARGS=(
   --warmup_steps "${WARMUP_STEPS:-0}"
   --report_to "${REPORT_TO:-tensorboard}"
 )
+
+if [[ "${ENABLE_THINKING:-false}" == "true" ]]; then
+  ARGS+=(--enable_thinking)
+else
+  ARGS+=(--no-enable_thinking)
+fi
 
 if [[ "$PRECISION" == "bf16" ]]; then
   ARGS+=(--bf16)

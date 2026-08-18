@@ -113,6 +113,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--languages", default="en,km,my,th,vi")
     parser.add_argument("--bactrian_validation_ratio", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--prompt_format", choices=["plain", "chat"], default="plain")
+    parser.add_argument(
+        "--enable_thinking", action=argparse.BooleanOptionalAction, default=False
+    )
     parser.add_argument("--contrastive_weight", type=float, default=0.0)
     parser.add_argument("--ot_weight", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=0.07)
@@ -196,7 +200,9 @@ def build_stage(args, tokenizer):
             trust_remote_code=args.trust_remote_code,
         )
         model.lm = apply_lora(model.lm, args)
-        collator = MultilingualDataCollator(tokenizer)
+        collator = MultilingualDataCollator(
+            tokenizer, args.prompt_format, args.enable_thinking
+        )
         return dataset, model, collator
 
     dataset = load_instruction_dataset(
@@ -207,7 +213,9 @@ def build_stage(args, tokenizer):
         args.model_name_or_path, trust_remote_code=args.trust_remote_code
     )
     model = apply_lora(model, args)
-    return dataset, model, InstructionDataCollator(tokenizer, args.max_length)
+    return dataset, model, InstructionDataCollator(
+        tokenizer, args.max_length, args.prompt_format, args.enable_thinking
+    )
 
 
 def main() -> None:
@@ -231,6 +239,14 @@ def main() -> None:
     set_seed(args.seed)
     LOGGER.info("Building stage=%s", args.stage)
     LOGGER.info("Model/checkpoint=%s | output=%s", args.model_name_or_path, args.output_dir)
+    LOGGER.info(
+        "Prompt format=%s | thinking=%s", args.prompt_format, args.enable_thinking
+    )
+    if args.enable_thinking:
+        LOGGER.warning(
+            "Thinking is enabled, but the current datasets contain direct targets "
+            "without supervised reasoning traces."
+        )
     LOGGER.info(
         "Precision bf16=%s fp16=%s | batch=%d | accumulation=%d | epochs=%s | lr=%g",
         args.bf16, args.fp16, args.batch_size,
@@ -267,6 +283,10 @@ def main() -> None:
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if args.prompt_format == "chat" and not tokenizer.chat_template:
+        raise ValueError(
+            "--prompt_format chat was requested but tokenizer.chat_template is empty."
+        )
     dataset, model, collator = build_stage(args, tokenizer)
     LOGGER.info(
         "Dataset built | train=%d | validation=%d | columns=%s",

@@ -22,6 +22,7 @@ ARGS=(
   --bactrian_dir "$BACTRIAN_DIR"
   --languages "$LANGUAGES"
   --output_dir "$OUTPUT_DIR"
+  --prompt_format "${PROMPT_FORMAT:-plain}"
   --learning_rate "${LEARNING_RATE:-1e-5}"
   --epochs "${EPOCHS:-2}"
   --batch_size "${BATCH_SIZE:-1}"
@@ -44,6 +45,12 @@ ARGS=(
   --warmup_steps "${WARMUP_STEPS:-0}"
   --report_to "${REPORT_TO:-tensorboard}"
 )
+
+if [[ "${ENABLE_THINKING:-false}" == "true" ]]; then
+  ARGS+=(--enable_thinking)
+else
+  ARGS+=(--no-enable_thinking)
+fi
 
 if [[ "$PRECISION" == "bf16" ]]; then
   ARGS+=(--bf16)

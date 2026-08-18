@@ -28,6 +28,50 @@ class MultilingualDataCollator:
     """
 
     tokenizer: PreTrainedTokenizerBase
+    prompt_format: str = "plain"
+    enable_thinking: bool = False
+
+    def _chat_prompt_and_source_span(
+        self, instruction: str, source: str
+    ) -> tuple[list[int], int, int]:
+        """Render the real chat template and locate source tokens via offsets."""
+        if not self.tokenizer.chat_template:
+            raise ValueError(
+                "prompt_format='chat' requires a tokenizer with chat_template."
+            )
+        user_content = instruction + source
+        try:
+            rendered = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": user_content}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=self.enable_thinking,
+            )
+        except TypeError as error:
+            raise ValueError(
+                "This tokenizer/chat template does not accept enable_thinking. "
+                "Use --prompt_format plain or update the tokenizer template."
+            ) from error
+        user_start = rendered.rfind(user_content)
+        if user_start < 0:
+            raise ValueError("Chat template changed the user text; cannot locate source span.")
+        char_start = user_start + len(instruction)
+        char_end = char_start + len(source)
+        encoded = self.tokenizer(
+            rendered, add_special_tokens=False, return_offsets_mapping=True
+        )
+        offsets = encoded.get("offset_mapping")
+        if offsets is None:
+            raise ValueError("Chat span detection requires a fast tokenizer with offsets.")
+        indices = [
+            index for index, (start, end) in enumerate(offsets)
+            if end > char_start and start < char_end
+        ]
+        if source and not indices:
+            raise ValueError("Could not map source characters to chat-template tokens.")
+        source_start = indices[0] if indices else len(encoded["input_ids"])
+        source_end = indices[-1] + 1 if indices else source_start
+        return encoded["input_ids"], source_start, source_end
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         # ------------------------------------------------------------------
@@ -45,21 +89,29 @@ class MultilingualDataCollator:
         for item, source, target in zip(features, sources, targets):
             # Instruction chứa hướng dịch; marker phân cách source với target.
             instruction = translation_instruction(item["source_lang"], item["target_lang"])
-            instruction_ids = self.tokenizer(instruction, add_special_tokens=False)["input_ids"]
-            marker_ids = self.tokenizer(TRANSLATION_TARGET_MARKER, add_special_tokens=False)["input_ids"]
-            source_ids = self.tokenizer(source, add_special_tokens=False)["input_ids"]
             target_ids = self.tokenizer(target, add_special_tokens=False)["input_ids"]
+
+            if self.prompt_format == "chat":
+                prompt_ids, source_start, source_end = self._chat_prompt_and_source_span(
+                    instruction, source
+                )
+                target_start = len(prompt_ids)
+                ids = prompt_ids + target_ids
+            else:
+                instruction_ids = self.tokenizer(instruction, add_special_tokens=False)["input_ids"]
+                marker_ids = self.tokenizer(TRANSLATION_TARGET_MARKER, add_special_tokens=False)["input_ids"]
+                source_ids = self.tokenizer(source, add_special_tokens=False)["input_ids"]
+                source_start = len(instruction_ids)
+                source_end = source_start + len(source_ids)
+                target_start = source_end + len(marker_ids)
+                ids = instruction_ids + source_ids + marker_ids + target_ids
 
             # ------------------------------------------------------------------
             # Block 3: Xác định các interval [start, end). Stage 1 không truncate
             # source/target; toàn bộ cặp câu được giữ nguyên cho NTP/CL/OT.
             # Các index này trỏ trực tiếp vào sequence được đưa qua model.
             # ------------------------------------------------------------------
-            source_start = len(instruction_ids)
-            source_end = source_start + len(source_ids)
-            target_start = source_end + len(marker_ids)
             target_end = target_start + len(target_ids)
-            ids = instruction_ids + source_ids + marker_ids + target_ids
             if eos_id is not None:
                 ids.append(eos_id)
 
@@ -118,6 +170,8 @@ class InstructionDataCollator:
 
     tokenizer: PreTrainedTokenizerBase
     max_length: int = 1024
+    prompt_format: str = "plain"
+    enable_thinking: bool = False
 
     def _prompt_ids(self, instruction: str, input_text: str) -> list[int]:
         # ------------------------------------------------------------------
@@ -125,6 +179,17 @@ class InstructionDataCollator:
         # template hay system/user/assistant special tokens.
         # ------------------------------------------------------------------
         user = instruction_user_prompt(instruction, input_text)
+        if self.prompt_format == "chat":
+            if not self.tokenizer.chat_template:
+                raise ValueError(
+                    "prompt_format='chat' requires a tokenizer with chat_template."
+                )
+            return self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": user}],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=self.enable_thinking,
+            )
         return self.tokenizer(
             instruction_prompt(user), add_special_tokens=True
         )["input_ids"]

@@ -28,15 +28,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--max_samples", type=int)
     parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--prompt_format", choices=["plain", "chat"], default="plain")
+    parser.add_argument(
+        "--enable_thinking", action=argparse.BooleanOptionalAction, default=False
+    )
     parser.add_argument("--trust_remote_code", action="store_true")
     return parser.parse_args()
 
 
-def build_prompt_ids(tokenizer, row: dict, max_length: int) -> list[int]:
+def build_prompt_ids(
+    tokenizer, row: dict, max_length: int,
+    prompt_format: str = "plain", enable_thinking: bool = False,
+) -> list[int]:
     # Fix one template during evaluation so predictions are reproducible.
     prefix = translation_instruction(
         row["source_lang"], row["target_lang"], template_index=0
     )
+    if prompt_format == "chat":
+        if not tokenizer.chat_template:
+            raise ValueError("prompt_format='chat' requires tokenizer.chat_template")
+        source_ids = tokenizer(row["source"], add_special_tokens=False)["input_ids"]
+        # Estimate chat overhead, then rebuild once after reducing the source.
+        def render(text):
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": prefix + text}],
+                tokenize=True, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        empty_length = len(render(""))
+        budget = max_length - empty_length
+        if budget < 1:
+            raise ValueError("max_input_length is too small for the chat template")
+        ids = render(tokenizer.decode(source_ids[:budget], skip_special_tokens=True))
+        while len(ids) > max_length and budget > 0:
+            budget -= len(ids) - max_length
+            ids = render(tokenizer.decode(source_ids[:max(0, budget)], skip_special_tokens=True))
+        return ids
     prefix_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
     marker_ids = tokenizer(TRANSLATION_TARGET_MARKER, add_special_tokens=False)["input_ids"]
     source_ids = tokenizer(row["source"], add_special_tokens=False)["input_ids"]
@@ -75,6 +102,8 @@ def main() -> None:
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if args.prompt_format == "chat" and not tokenizer.chat_template:
+        raise ValueError("--prompt_format chat requires tokenizer.chat_template")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype="auto",
@@ -110,7 +139,10 @@ def main() -> None:
 
         for row_batch in batches(iter(rows), args.batch_size):
             prompt_rows = [
-                build_prompt_ids(tokenizer, row, args.max_input_length)
+                build_prompt_ids(
+                    tokenizer, row, args.max_input_length,
+                    args.prompt_format, args.enable_thinking,
+                )
                 for row in row_batch
             ]
             width = max(map(len, prompt_rows))
@@ -125,14 +157,21 @@ def main() -> None:
                 input_ids[index, -length:] = torch.tensor(ids, device=device)
                 attention_mask[index, -length:] = 1
             with torch.inference_mode():
+                generation_kwargs = {}
+                if args.enable_thinking:
+                    generation_kwargs.update(
+                        do_sample=True, temperature=0.6, top_p=0.95, top_k=20
+                    )
+                else:
+                    generation_kwargs["do_sample"] = False
                 generated = model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=args.max_new_tokens,
                     num_beams=args.num_beams,
-                    do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
+                    **generation_kwargs,
                 )
             predictions = tokenizer.batch_decode(
                 generated[:, width:], skip_special_tokens=True
