@@ -239,3 +239,78 @@ class InstructionDataCollator:
             labels[index, :length] = torch.tensor(row_labels)
         # Stage 2 không cần span positions vì không tính contrastive/OT.
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
+@dataclass
+class TranslationInferenceCollator:
+    """Pre-tokenize translation prompts, then left-pad generation batches."""
+
+    tokenizer: PreTrainedTokenizerBase
+    max_input_length: int = 512
+    prompt_format: str = "plain"
+    enable_thinking: bool = False
+
+    def encode(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Tokenize one sample without padding; call this for the whole dataset first."""
+        prefix = translation_instruction(
+            row["source_lang"], row["target_lang"], template_index=0
+        )
+        if self.prompt_format == "chat":
+            if not self.tokenizer.chat_template:
+                raise ValueError("prompt_format='chat' requires tokenizer.chat_template")
+            source_ids = self.tokenizer(
+                str(row["source"]), add_special_tokens=False
+            )["input_ids"]
+
+            def render(text: str) -> list[int]:
+                return self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prefix + text}],
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=self.enable_thinking,
+                )
+
+            empty_length = len(render(""))
+            budget = self.max_input_length - empty_length
+            if budget < 1:
+                raise ValueError("max_input_length is too small for the chat template")
+            input_ids = render(
+                self.tokenizer.decode(source_ids[:budget], skip_special_tokens=True)
+            )
+            while len(input_ids) > self.max_input_length and budget > 0:
+                budget = max(0, budget - (len(input_ids) - self.max_input_length))
+                input_ids = render(
+                    self.tokenizer.decode(source_ids[:budget], skip_special_tokens=True)
+                )
+        else:
+            prefix_ids = self.tokenizer(prefix, add_special_tokens=False)["input_ids"]
+            marker_ids = self.tokenizer(
+                TRANSLATION_TARGET_MARKER, add_special_tokens=False
+            )["input_ids"]
+            source_ids = self.tokenizer(
+                str(row["source"]), add_special_tokens=False
+            )["input_ids"]
+            source_budget = self.max_input_length - len(prefix_ids) - len(marker_ids)
+            if source_budget < 1:
+                raise ValueError("max_input_length is too small for the translation prompt")
+            input_ids = prefix_ids + source_ids[:source_budget] + marker_ids
+        return {"row": row, "input_ids": input_ids}
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Left-pad a batch already produced by :meth:`encode`."""
+        width = max(len(feature["input_ids"]) for feature in features)
+        input_ids = torch.full(
+            (len(features), width), self.tokenizer.pad_token_id, dtype=torch.long
+        )
+        attention_mask = torch.zeros_like(input_ids)
+        for index, feature in enumerate(features):
+            ids = feature["input_ids"]
+            length = len(ids)
+            input_ids[index, -length:] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[index, -length:] = 1
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "rows": [feature["row"] for feature in features],
+            "prompt_width": width,
+        }

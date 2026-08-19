@@ -3,17 +3,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from contextlib import ExitStack
 from collections import defaultdict
-from itertools import islice
 from pathlib import Path
 
 import torch
+from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm.auto import tqdm
 
+from .collator import TranslationInferenceCollator
 from .prepare_data import _discover_mt, _parallel_rows
-from .prompts import TRANSLATION_TARGET_MARKER, translation_instruction
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,57 +29,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--max_samples", type=int)
     parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "float32", "float16", "bfloat16"],
+        default="auto",
+    )
     parser.add_argument("--prompt_format", choices=["plain", "chat"], default="plain")
     parser.add_argument(
         "--enable_thinking", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument("--trust_remote_code", action="store_true")
     return parser.parse_args()
-
-
-def build_prompt_ids(
-    tokenizer, row: dict, max_length: int,
-    prompt_format: str = "plain", enable_thinking: bool = False,
-) -> list[int]:
-    # Fix one template during evaluation so predictions are reproducible.
-    prefix = translation_instruction(
-        row["source_lang"], row["target_lang"], template_index=0
-    )
-    if prompt_format == "chat":
-        if not tokenizer.chat_template:
-            raise ValueError("prompt_format='chat' requires tokenizer.chat_template")
-        source_ids = tokenizer(row["source"], add_special_tokens=False)["input_ids"]
-        # Estimate chat overhead, then rebuild once after reducing the source.
-        def render(text):
-            return tokenizer.apply_chat_template(
-                [{"role": "user", "content": prefix + text}],
-                tokenize=True, add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-            )
-        empty_length = len(render(""))
-        budget = max_length - empty_length
-        if budget < 1:
-            raise ValueError("max_input_length is too small for the chat template")
-        ids = render(tokenizer.decode(source_ids[:budget], skip_special_tokens=True))
-        while len(ids) > max_length and budget > 0:
-            budget -= len(ids) - max_length
-            ids = render(tokenizer.decode(source_ids[:max(0, budget)], skip_special_tokens=True))
-        return ids
-    prefix_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
-    marker_ids = tokenizer(TRANSLATION_TARGET_MARKER, add_special_tokens=False)["input_ids"]
-    source_ids = tokenizer(row["source"], add_special_tokens=False)["input_ids"]
-    source_budget = max_length - len(prefix_ids) - len(marker_ids)
-    if source_budget < 1:
-        raise ValueError("max_input_length is too small for the translation prompt")
-    return prefix_ids + source_ids[:source_budget] + marker_ids
-
-
-def batches(iterator, size: int):
-    while True:
-        batch = list(islice(iterator, size))
-        if not batch:
-            return
-        yield batch
 
 
 def limit_per_direction(iterator, limit: int | None):
@@ -104,24 +66,99 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     if args.prompt_format == "chat" and not tokenizer.chat_template:
         raise ValueError("--prompt_format chat requires tokenizer.chat_template")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda was requested, but torch.cuda.is_available() is False")
+    dtype = {
+        "auto": "auto",
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[args.dtype]
+    load_kwargs = {
+        "torch_dtype": dtype,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if args.device == "auto":
+        load_kwargs["device_map"] = "auto"
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype="auto",
-        device_map="auto",
-        trust_remote_code=args.trust_remote_code,
+        args.model_name_or_path, **load_kwargs
     )
+    if args.device in {"cuda", "cpu"}:
+        model.to(args.device)
     model.eval()
     device = model.get_input_embeddings().weight.device
+    device_map = getattr(model, "hf_device_map", None)
+    print(f"CUDA available : {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device    : {torch.cuda.get_device_name(0)}")
+    print(f"Requested mode : {args.device}")
+    print(f"Input device   : {device}")
+    print(f"Model dtype    : {next(model.parameters()).dtype}")
+    print(f"HF device map  : {device_map if device_map is not None else 'single device'}")
+    if device_map and any(str(value) in {"cpu", "disk"} for value in device_map.values()):
+        print("WARNING: Some model layers are offloaded to CPU/disk; generation will be slow.")
 
     paths = _discover_mt(args.data_dir, "test", args.language_pairs)
-    rows = limit_per_direction(
-        _parallel_rows(paths, args.direction), args.max_samples
+    inference_collator = TranslationInferenceCollator(
+        tokenizer=tokenizer,
+        max_input_length=args.max_input_length,
+        prompt_format=args.prompt_format,
+        enable_thinking=args.enable_thinking,
     )
+    # Materialize the selected test set first, then tokenize every prompt before
+    # generation. This keeps tokenization time separate from generation time.
+    print("Loading test samples...", flush=True)
+    rows = list(limit_per_direction(
+        _parallel_rows(paths, args.direction), args.max_samples
+    ))
+    total_rows = len(rows)
+    print(f"Test samples   : {total_rows}", flush=True)
+    if total_rows == 0:
+        raise ValueError("No test samples matched the requested language pairs/direction")
+    tokenized_rows = [
+        inference_collator.encode(row)
+        for row in tqdm(
+            rows,
+            total=total_rows,
+            desc="Tokenizing prompts",
+            unit="sample",
+            dynamic_ncols=True,
+            file=sys.stdout,
+        )
+    ]
+    # DataLoader forms fixed-size batches. The inference collator left-pads each
+    # batch independently to that batch's longest prompt. Materialize all
+    # collated batches now so no tokenization/collation happens during generate.
+    data_loader = DataLoader(
+        tokenized_rows,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=inference_collator,
+    )
+    print("Collating inference batches...", flush=True)
+    collated_batches = list(tqdm(
+        data_loader,
+        total=len(data_loader),
+        desc="Collating batches",
+        unit="batch",
+        dynamic_ncols=True,
+        file=sys.stdout,
+    ))
+    print(f"Collated batches: {len(collated_batches)}", flush=True)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     counts = defaultdict(int)
-    with ExitStack() as stack, tqdm(desc="Generating translations", unit="sample") as progress:
+    with ExitStack() as stack, tqdm(
+        total=total_rows,
+        desc="Generating translations",
+        unit="sample",
+        dynamic_ncols=True,
+        file=sys.stdout,
+        mininterval=0.1,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
+        "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+    ) as progress:
         writers = {}
 
         def writer_for(row: dict):
@@ -137,25 +174,13 @@ def main() -> None:
                 writers[direction].writeheader()
             return direction, writers[direction]
 
-        for row_batch in batches(iter(rows), args.batch_size):
-            prompt_rows = [
-                build_prompt_ids(
-                    tokenizer, row, args.max_input_length,
-                    args.prompt_format, args.enable_thinking,
-                )
-                for row in row_batch
-            ]
-            width = max(map(len, prompt_rows))
-            input_ids = torch.full(
-                (len(prompt_rows), width), tokenizer.pad_token_id,
-                dtype=torch.long, device=device,
-            )
-            attention_mask = torch.zeros_like(input_ids)
-            # Left padding is required for batched generation by a decoder-only LM.
-            for index, ids in enumerate(prompt_rows):
-                length = len(ids)
-                input_ids[index, -length:] = torch.tensor(ids, device=device)
-                attention_mask[index, -length:] = 1
+        for batch in collated_batches:
+            # Tokenization, batching and padding are already complete. The
+            # generation loop only transfers a prepared batch to the model.
+            row_batch = batch["rows"]
+            prompt_width = batch["prompt_width"]
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
             with torch.inference_mode():
                 generation_kwargs = {}
                 if args.enable_thinking:
@@ -174,7 +199,7 @@ def main() -> None:
                     **generation_kwargs,
                 )
             predictions = tokenizer.batch_decode(
-                generated[:, width:], skip_special_tokens=True
+                generated[:, prompt_width:], skip_special_tokens=True
             )
             for row, prediction in zip(row_batch, predictions):
                 direction, writer = writer_for(row)
