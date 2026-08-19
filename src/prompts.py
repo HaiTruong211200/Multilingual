@@ -4,6 +4,30 @@ from __future__ import annotations
 import random
 
 
+# Canonical names used inside natural-language prompts. Dataset filtering and
+# file discovery continue to use compact ISO-style codes.
+LANGUAGE_NAMES = {
+    "en": "English",
+    "vi": "Vietnamese",
+    "km": "Khmer",
+    "lo": "Lao",
+    "my": "Burmese",
+    "th": "Thai",
+    "zh": "Chinese",
+    "zh-cn": "Simplified Chinese",
+    "zh-tw": "Traditional Chinese",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "tl": "Filipino",
+}
+
+
+def language_name(language_code: str) -> str:
+    """Return a prompt-friendly language name, falling back to the input code."""
+    normalized = str(language_code).strip().lower().replace("_", "-")
+    return LANGUAGE_NAMES.get(normalized, str(language_code).strip())
+
+
 TRANSLATION_INSTRUCTION_TEMPLATES = (
     "Translate this text from {src_lang} to {tgt_lang}.",
     "Convert this sentence from {src_lang} to {tgt_lang}.",
@@ -28,15 +52,18 @@ def translation_instruction(
         template = random.choice(TRANSLATION_INSTRUCTION_TEMPLATES)
     else:
         template = TRANSLATION_INSTRUCTION_TEMPLATES[template_index]
-    instruction = template.format(src_lang=source_lang, tgt_lang=target_lang)
-    return f"{instruction}\nSource: "
+    instruction = template.format(
+        src_lang=language_name(source_lang),
+        tgt_lang=language_name(target_lang),
+    )
+    return f"{instruction}\nSource:\n"
 
 
-TRANSLATION_TARGET_MARKER = "\nTranslation: "
+TRANSLATION_TARGET_MARKER = "\nTranslation:\n"
 
 
 def summarization_instruction(language: str) -> str:
-    return f"Summarize the following article in {language}."
+    return f"Summarize the following article in {language_name(language)}."
 
 
 def instruction_user_prompt(instruction: str, input_text: str) -> str:

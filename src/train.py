@@ -10,7 +10,11 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from .collator import InstructionDataCollator, MultilingualDataCollator
 from .model import MultilingualAlignmentModel
-from .prepare_data import load_instruction_dataset, load_parallel_dataset
+from .prepare_data import (
+    load_instruction_dataset,
+    load_parallel_dataset,
+    prepare_alignment_dataset,
+)
 
 LOGGER = logging.getLogger("multilingual_training")
 
@@ -115,6 +119,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--prompt_format", choices=["plain", "chat"], default="plain")
     parser.add_argument(
+        "--training_mode", choices=["finetune", "continue"], default="finetune"
+    )
+    parser.add_argument(
         "--enable_thinking", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument("--contrastive_weight", type=float, default=0.0)
@@ -187,6 +194,10 @@ def build_stage(args, tokenizer):
             args.data_dir, args.language_pairs, args.direction,
             args.train_file, args.validation_file,
         )
+        dataset = prepare_alignment_dataset(
+            dataset, tokenizer, args.prompt_format, args.enable_thinking,
+            args.training_mode,
+        )
         model = MultilingualAlignmentModel(
             args.model_name_or_path,
             contrastive_weight=args.contrastive_weight,
@@ -200,9 +211,7 @@ def build_stage(args, tokenizer):
             trust_remote_code=args.trust_remote_code,
         )
         model.lm = apply_lora(model.lm, args)
-        collator = MultilingualDataCollator(
-            tokenizer, args.prompt_format, args.enable_thinking
-        )
+        collator = MultilingualDataCollator(tokenizer)
         return dataset, model, collator
 
     dataset = load_instruction_dataset(
@@ -214,7 +223,8 @@ def build_stage(args, tokenizer):
     )
     model = apply_lora(model, args)
     return dataset, model, InstructionDataCollator(
-        tokenizer, args.max_length, args.prompt_format, args.enable_thinking
+        tokenizer, args.max_length, args.prompt_format, args.enable_thinking,
+        args.training_mode,
     )
 
 
@@ -240,7 +250,8 @@ def main() -> None:
     LOGGER.info("Building stage=%s", args.stage)
     LOGGER.info("Model/checkpoint=%s | output=%s", args.model_name_or_path, args.output_dir)
     LOGGER.info(
-        "Prompt format=%s | thinking=%s", args.prompt_format, args.enable_thinking
+        "Prompt format=%s | thinking=%s | training_mode=%s",
+        args.prompt_format, args.enable_thinking, args.training_mode,
     )
     if args.enable_thinking:
         LOGGER.warning(
@@ -259,9 +270,9 @@ def main() -> None:
     )
     if args.stage == "alignment":
         LOGGER.info(
-            "Data MT=%s | pairs=%s | direction=%s | loss=NTP + %.4g*CL + %.4g*OT",
+            "Data MT=%s | pairs=%s | direction=%s | mode=%s | loss=NTP + %.4g*CL + %.4g*OT",
             args.data_dir, args.language_pairs, args.direction,
-            args.contrastive_weight, args.ot_weight,
+            args.training_mode, args.contrastive_weight, args.ot_weight,
         )
         LOGGER.info(
             "Alignment layer=%d | contrastive_temperature=%g | attention_mass_weight=%g | Sinkhorn eps=%g iterations=%d",
@@ -270,8 +281,8 @@ def main() -> None:
         )
     else:
         LOGGER.info(
-            "Data XLSum=%s | Bactrian=%s | languages=%s | loss=response-only NTP",
-            args.xlsum_dir, args.bactrian_dir, args.languages,
+            "Data XLSum=%s | Bactrian=%s | languages=%s | mode=%s | loss=NTP",
+            args.xlsum_dir, args.bactrian_dir, args.languages, args.training_mode,
         )
     LOGGER.info(
         "LoRA=%s | r=%d alpha=%d dropout=%g targets=%s",
@@ -294,10 +305,14 @@ def main() -> None:
         dataset["train"].column_names,
     )
     sample = dataset["train"][0]
-    sample_summary = {
-        key: value[:240] + "..." if isinstance(value, str) and len(value) > 240 else value
-        for key, value in sample.items()
-    }
+    sample_summary = {}
+    for key, value in sample.items():
+        if isinstance(value, str) and len(value) > 240:
+            sample_summary[key] = value[:240] + "..."
+        elif isinstance(value, list) and len(value) > 20:
+            sample_summary[key] = {"length": len(value), "head": value[:20]}
+        else:
+            sample_summary[key] = value
     LOGGER.info("Processed sample=%s", sample_summary)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -348,6 +363,11 @@ def main() -> None:
     if isinstance(export_model, PeftModel):
         # Export a regular HF checkpoint so Stage 2 can load Stage 1 directly.
         export_model = export_model.merge_and_unload()
+    # Gradient checkpointing requires cache=False during training, but the final
+    # exported causal LM should default back to fast KV-cached generation.
+    if hasattr(export_model, "gradient_checkpointing_disable"):
+        export_model.gradient_checkpointing_disable()
+    export_model.config.use_cache = True
     export_model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 

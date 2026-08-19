@@ -20,6 +20,7 @@ ARGS=(
   --output_dir "$OUTPUT_DIR"
   --direction "$DIRECTION"
   --prompt_format "${PROMPT_FORMAT:-plain}"
+  --training_mode "${TRAINING_MODE:-finetune}"
   --align_layer "${ALIGN_LAYER:--1}"
   --contrastive_weight "${CONTRASTIVE_WEIGHT:-0.0}"
   --temperature "${CONTRASTIVE_TEMPERATURE:-0.07}"

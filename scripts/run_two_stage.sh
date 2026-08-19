@@ -12,6 +12,7 @@ LANGUAGE_PAIRS="${TRANSLATION_PAIRS:-all}" \
 PRECISION="${PRECISION:-bf16}" \
 PROMPT_FORMAT="${STAGE1_PROMPT_FORMAT:-plain}" \
 ENABLE_THINKING="${STAGE1_ENABLE_THINKING:-false}" \
+TRAINING_MODE="${STAGE1_TRAINING_MODE:-finetune}" \
 "$SCRIPT_DIR/run_stage1_alignment.sh"
 
 echo "========== Stage 2: response-only NTP =========="
@@ -21,4 +22,5 @@ LANGUAGES="${INSTRUCTION_LANGUAGES:-en,km,my,th,vi}" \
 PRECISION="${PRECISION:-bf16}" \
 PROMPT_FORMAT="${STAGE2_PROMPT_FORMAT:-plain}" \
 ENABLE_THINKING="${STAGE2_ENABLE_THINKING:-false}" \
+TRAINING_MODE="${STAGE2_TRAINING_MODE:-finetune}" \
 "$SCRIPT_DIR/run_stage2_instruction_ft.sh"

@@ -31,49 +31,104 @@ class MultilingualDataCollator:
     prompt_format: str = "plain"
     enable_thinking: bool = False
 
-    def _chat_prompt_and_source_span(
-        self, instruction: str, source: str
-    ) -> tuple[list[int], int, int]:
-        """Render the real chat template and locate source tokens via offsets."""
-        if not self.tokenizer.chat_template:
-            raise ValueError(
-                "prompt_format='chat' requires a tokenizer with chat_template."
-            )
-        user_content = instruction + source
-        try:
-            rendered = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": user_content}],
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=self.enable_thinking,
-            )
-        except TypeError as error:
-            raise ValueError(
-                "This tokenizer/chat template does not accept enable_thinking. "
-                "Use --prompt_format plain or update the tokenizer template."
-            ) from error
-        user_start = rendered.rfind(user_content)
-        if user_start < 0:
-            raise ValueError("Chat template changed the user text; cannot locate source span.")
-        char_start = user_start + len(instruction)
-        char_end = char_start + len(source)
-        encoded = self.tokenizer(
-            rendered, add_special_tokens=False, return_offsets_mapping=True
-        )
-        offsets = encoded.get("offset_mapping")
-        if offsets is None:
-            raise ValueError("Chat span detection requires a fast tokenizer with offsets.")
+    @staticmethod
+    def _token_span(offsets, char_start: int, char_end: int, name: str):
         indices = [
             index for index, (start, end) in enumerate(offsets)
             if end > char_start and start < char_end
         ]
-        if source and not indices:
-            raise ValueError("Could not map source characters to chat-template tokens.")
-        source_start = indices[0] if indices else len(encoded["input_ids"])
-        source_end = indices[-1] + 1 if indices else source_start
-        return encoded["input_ids"], source_start, source_end
+        if not indices:
+            raise ValueError(f"Could not map non-empty {name} text to tokens.")
+        return indices[0], indices[-1] + 1
+
+    def _encode_full_sample(
+        self, instruction: str, source: str, target: str
+    ) -> tuple[list[int], int, int, int, int]:
+        """Render source+target, tokenize once, then derive spans from offsets."""
+        if self.prompt_format == "chat":
+            if not self.tokenizer.chat_template:
+                raise ValueError("prompt_format='chat' requires tokenizer.chat_template")
+            user_content = instruction + source
+            rendered = self.tokenizer.apply_chat_template(
+                [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": target},
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=self.enable_thinking,
+            )
+            user_start = rendered.rfind(user_content)
+            target_char_start = rendered.rfind(target)
+            if user_start < 0 or target_char_start < 0:
+                raise ValueError("Chat template changed source/target text; spans are unavailable")
+            source_char_start = user_start + len(instruction)
+            source_char_end = source_char_start + len(source)
+            target_char_end = target_char_start + len(target)
+            add_special_tokens = False  # chat template already rendered them
+        else:
+            rendered = instruction + source + TRANSLATION_TARGET_MARKER + target
+            source_char_start = len(instruction)
+            source_char_end = source_char_start + len(source)
+            target_char_start = source_char_end + len(TRANSLATION_TARGET_MARKER)
+            target_char_end = target_char_start + len(target)
+            add_special_tokens = True
+
+        encoded = self.tokenizer(
+            rendered,
+            add_special_tokens=add_special_tokens,
+            return_offsets_mapping=True,
+        )
+        offsets = encoded.get("offset_mapping")
+        if offsets is None:
+            raise ValueError("Alignment requires a fast tokenizer with offset_mapping")
+        source_start, source_end = self._token_span(
+            offsets, source_char_start, source_char_end, "source"
+        )
+        target_start, target_end = self._token_span(
+            offsets, target_char_start, target_char_end, "target"
+        )
+        return encoded["input_ids"], source_start, source_end, target_start, target_end
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # Tokenization, labels and alignment spans are prepared once in
+        # prepare_alignment_dataset(). This collator only pads a ready batch.
+        if features and "input_ids" in features[0] and "labels" in features[0]:
+            width = max(len(item["input_ids"]) for item in features)
+            input_ids = torch.full(
+                (len(features), width), self.tokenizer.pad_token_id, dtype=torch.long
+            )
+            attention_mask = torch.zeros_like(input_ids)
+            labels = torch.full_like(input_ids, -100)
+            for index, item in enumerate(features):
+                length = len(item["input_ids"])
+                input_ids[index, :length] = torch.tensor(item["input_ids"])
+                attention_mask[index, :length] = 1
+                labels[index, :length] = torch.tensor(item["labels"])
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+                "source_start_positions": torch.tensor(
+                    [item["source_start_positions"] for item in features]
+                ),
+                "source_end_positions": torch.tensor(
+                    [item["source_end_positions"] for item in features]
+                ),
+                "target_start_positions": torch.tensor(
+                    [item["target_start_positions"] for item in features]
+                ),
+                "target_end_positions": torch.tensor(
+                    [item["target_end_positions"] for item in features]
+                ),
+            }
+        raise ValueError(
+            "MultilingualDataCollator expects a dataset processed by "
+            "prepare_alignment_dataset(); raw text is not accepted."
+        )
+
+        # Legacy implementation below is intentionally unreachable and will be
+        # removed after old notebooks have migrated to prepare_alignment_dataset.
         # ------------------------------------------------------------------
         # Block 1: Lấy text nguồn/đích từ các sample đã được prepare_data.
         # ------------------------------------------------------------------
@@ -89,30 +144,16 @@ class MultilingualDataCollator:
         for item, source, target in zip(features, sources, targets):
             # Instruction chứa hướng dịch; marker phân cách source với target.
             instruction = translation_instruction(item["source_lang"], item["target_lang"])
-            target_ids = self.tokenizer(target, add_special_tokens=False)["input_ids"]
-
-            if self.prompt_format == "chat":
-                prompt_ids, source_start, source_end = self._chat_prompt_and_source_span(
-                    instruction, source
-                )
-                target_start = len(prompt_ids)
-                ids = prompt_ids + target_ids
-            else:
-                instruction_ids = self.tokenizer(instruction, add_special_tokens=False)["input_ids"]
-                marker_ids = self.tokenizer(TRANSLATION_TARGET_MARKER, add_special_tokens=False)["input_ids"]
-                source_ids = self.tokenizer(source, add_special_tokens=False)["input_ids"]
-                source_start = len(instruction_ids)
-                source_end = source_start + len(source_ids)
-                target_start = source_end + len(marker_ids)
-                ids = instruction_ids + source_ids + marker_ids + target_ids
+            ids, source_start, source_end, target_start, target_end = (
+                self._encode_full_sample(instruction, source, target)
+            )
 
             # ------------------------------------------------------------------
             # Block 3: Xác định các interval [start, end). Stage 1 không truncate
             # source/target; toàn bộ cặp câu được giữ nguyên cho NTP/CL/OT.
             # Các index này trỏ trực tiếp vào sequence được đưa qua model.
             # ------------------------------------------------------------------
-            target_end = target_start + len(target_ids)
-            if eos_id is not None:
+            if eos_id is not None and (not ids or ids[-1] != eos_id):
                 ids.append(eos_id)
 
             # Không âm thầm cắt dữ liệu. Nếu model công bố context window hữu
@@ -172,6 +213,7 @@ class InstructionDataCollator:
     max_length: int = 1024
     prompt_format: str = "plain"
     enable_thinking: bool = False
+    training_mode: str = "finetune"
 
     def _prompt_ids(self, instruction: str, input_text: str) -> list[int]:
         # ------------------------------------------------------------------
@@ -221,7 +263,12 @@ class InstructionDataCollator:
             ids = prompt_ids + response_ids
 
             # Prompt nhận -100; chỉ response và EOS được tính NTP loss.
-            rows.append((ids, [-100] * len(prompt_ids) + response_ids))
+            row_labels = (
+                [-100] * len(prompt_ids) + response_ids
+                if self.training_mode == "finetune"
+                else ids.copy()
+            )
+            rows.append((ids, row_labels))
 
         # ------------------------------------------------------------------
         # Block 4: Right padding giống Stage 1. Padding labels luôn là -100.
@@ -243,61 +290,12 @@ class InstructionDataCollator:
 
 @dataclass
 class TranslationInferenceCollator:
-    """Pre-tokenize translation prompts, then left-pad generation batches."""
+    """Only pad samples already tokenized by prepare_data; never tokenize here."""
 
     tokenizer: PreTrainedTokenizerBase
-    max_input_length: int = 512
-    prompt_format: str = "plain"
-    enable_thinking: bool = False
-
-    def encode(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """Tokenize one sample without padding; call this for the whole dataset first."""
-        prefix = translation_instruction(
-            row["source_lang"], row["target_lang"], template_index=0
-        )
-        if self.prompt_format == "chat":
-            if not self.tokenizer.chat_template:
-                raise ValueError("prompt_format='chat' requires tokenizer.chat_template")
-            source_ids = self.tokenizer(
-                str(row["source"]), add_special_tokens=False
-            )["input_ids"]
-
-            def render(text: str) -> list[int]:
-                return self.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": prefix + text}],
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    enable_thinking=self.enable_thinking,
-                )
-
-            empty_length = len(render(""))
-            budget = self.max_input_length - empty_length
-            if budget < 1:
-                raise ValueError("max_input_length is too small for the chat template")
-            input_ids = render(
-                self.tokenizer.decode(source_ids[:budget], skip_special_tokens=True)
-            )
-            while len(input_ids) > self.max_input_length and budget > 0:
-                budget = max(0, budget - (len(input_ids) - self.max_input_length))
-                input_ids = render(
-                    self.tokenizer.decode(source_ids[:budget], skip_special_tokens=True)
-                )
-        else:
-            prefix_ids = self.tokenizer(prefix, add_special_tokens=False)["input_ids"]
-            marker_ids = self.tokenizer(
-                TRANSLATION_TARGET_MARKER, add_special_tokens=False
-            )["input_ids"]
-            source_ids = self.tokenizer(
-                str(row["source"]), add_special_tokens=False
-            )["input_ids"]
-            source_budget = self.max_input_length - len(prefix_ids) - len(marker_ids)
-            if source_budget < 1:
-                raise ValueError("max_input_length is too small for the translation prompt")
-            input_ids = prefix_ids + source_ids[:source_budget] + marker_ids
-        return {"row": row, "input_ids": input_ids}
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Left-pad a batch already produced by :meth:`encode`."""
+        """Left-pad to the longest pre-tokenized prompt in this batch."""
         width = max(len(feature["input_ids"]) for feature in features)
         input_ids = torch.full(
             (len(features), width), self.tokenizer.pad_token_id, dtype=torch.long
@@ -311,6 +309,9 @@ class TranslationInferenceCollator:
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "rows": [feature["row"] for feature in features],
+            "rows": [
+                {key: value for key, value in feature.items() if key != "input_ids"}
+                for feature in features
+            ],
             "prompt_width": width,
         }

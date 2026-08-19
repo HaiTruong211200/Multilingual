@@ -16,8 +16,9 @@ ARGS=(
   --max_input_length "${MAX_INPUT_LENGTH:-512}"
   --max_new_tokens "${MAX_NEW_TOKENS:-256}"
   --num_beams "${NUM_BEAMS:-1}"
+  --attn_implementation "${ATTN_IMPLEMENTATION:-sdpa}"
   --device "${DEVICE:-auto}"
-  --dtype "${DTYPE:-auto}"
+  --dtype "${DTYPE:-float16}"
   --prompt_format "${PROMPT_FORMAT:-plain}"
 )
 if [[ "${ENABLE_THINKING:-false}" == "true" ]]; then

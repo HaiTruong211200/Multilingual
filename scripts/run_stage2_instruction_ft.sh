@@ -23,6 +23,7 @@ ARGS=(
   --languages "$LANGUAGES"
   --output_dir "$OUTPUT_DIR"
   --prompt_format "${PROMPT_FORMAT:-plain}"
+  --training_mode "${TRAINING_MODE:-finetune}"
   --learning_rate "${LEARNING_RATE:-1e-5}"
   --epochs "${EPOCHS:-2}"
   --batch_size "${BATCH_SIZE:-1}"
