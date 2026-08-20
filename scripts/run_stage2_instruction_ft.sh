@@ -31,6 +31,7 @@ ARGS=(
   --max_length "${MAX_LENGTH:-1024}"
   --bactrian_validation_ratio "${BACTRIAN_VALIDATION_RATIO:-0.01}"
   --seed "${SEED:-42}"
+  --data_seed "${DATA_SEED:-${SEED:-42}}"
   --gradient_checkpointing
   --use_lora
   --lora_r "${LORA_R:-16}"

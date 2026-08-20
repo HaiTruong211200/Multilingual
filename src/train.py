@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from collections import defaultdict
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
@@ -101,6 +103,29 @@ class ComponentLoggingTrainer(Trainer):
             return super().log(logs)
         return super().log(logs, start_time)
 
+    def _save(self, output_dir=None, state_dict=None):
+        """Save Stage 1 through the wrapped LM so PEFT/tied weights stay valid."""
+        if self.stage != "alignment":
+            return super()._save(output_dir, state_dict)
+
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        language_model = unwrapped.lm
+
+        # PeftModel.save_pretrained writes adapter weights only. A regular HF LM
+        # writes its config and understands tied embed/lm_head weights, unlike
+        # safetensors.save_file on the outer alignment wrapper's raw state_dict.
+        language_model.save_pretrained(
+            output_dir,
+            safe_serialization=self.args.save_safetensors,
+        )
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+        LOGGER.info(
+            "Saved Stage 1 checkpoint via %s.save_pretrained to %s",
+            type(language_model).__name__, output_dir,
+        )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -137,6 +162,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--data_seed", type=int, default=None,
+        help="Seed for Trainer's train-dataloader shuffle; defaults to --seed.",
+    )
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
@@ -230,6 +259,8 @@ def build_stage(args, tokenizer):
 
 def main() -> None:
     args = parse_args()
+    if args.data_seed is None:
+        args.data_seed = args.seed
     if args.logging_steps <= 0 or args.save_steps <= 0 or args.eval_steps <= 0:
         raise ValueError("logging_steps, save_steps, and eval_steps must be positive")
     if args.warmup_steps < 0:
@@ -262,6 +293,10 @@ def main() -> None:
         "Precision bf16=%s fp16=%s | batch=%d | accumulation=%d | epochs=%s | lr=%g",
         args.bf16, args.fp16, args.batch_size,
         args.gradient_accumulation_steps, args.epochs, args.learning_rate,
+    )
+    LOGGER.info(
+        "Random seed=%d | data shuffle seed=%d | train shuffle=True | eval shuffle=False",
+        args.seed, args.data_seed,
     )
     LOGGER.info(
         "Schedule=%s | warmup_steps=%d | logging_steps=%d | save=%s/%d | eval=%s/%d",
@@ -350,6 +385,8 @@ def main() -> None:
         report_to=args.report_to,
         load_best_model_at_end=True,
         save_total_limit=2,
+        seed=args.seed,
+        data_seed=args.data_seed,
     )
     trainer = ComponentLoggingTrainer(
         model=model, args=training_args,

@@ -33,6 +33,7 @@ ARGS=(
   --sinkhorn_iterations "${SINKHORN_ITERATIONS:-20}"
   --sinkhorn_epsilon "${SINKHORN_EPSILON:-0.1}"
   --seed "${SEED:-42}"
+  --data_seed "${DATA_SEED:-${SEED:-42}}"
   --attn_implementation eager
   --gradient_checkpointing
   --use_lora
