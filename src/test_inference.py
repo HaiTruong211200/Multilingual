@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftConfig, PeftModel
 from tqdm.auto import tqdm
 
 from .collator import TranslationInferenceCollator
@@ -129,9 +130,17 @@ def main() -> None:
     }
     if args.device == "auto":
         load_kwargs["device_map"] = "auto"
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path, **load_kwargs
-    )
+    adapter_config_path = Path(args.model_name_or_path) / "adapter_config.json"
+    if adapter_config_path.exists():
+        peft_config = PeftConfig.from_pretrained(args.model_name_or_path)
+        model = AutoModelForCausalLM.from_pretrained(
+            peft_config.base_model_name_or_path, **load_kwargs
+        )
+        model = PeftModel.from_pretrained(model, args.model_name_or_path)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path, **load_kwargs
+        )
     if args.device in {"cuda", "cpu"}:
         model.to(args.device)
     # Training enables gradient checkpointing and sets use_cache=False. If that

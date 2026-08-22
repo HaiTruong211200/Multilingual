@@ -4,11 +4,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from pathlib import Path
 from collections import defaultdict
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 
 from .collator import InstructionDataCollator, MultilingualDataCollator
 from .model import MultilingualAlignmentModel
@@ -204,6 +205,9 @@ def apply_lora(model, args):
     """Attach trainable LoRA adapters while freezing the original LM weights."""
     if not args.use_lora:
         return model
+    if isinstance(model, PeftModel):
+        # A saved Stage 1 adapter is already attached and trainable.
+        return model
     config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=args.lora_r,
@@ -215,6 +219,25 @@ def apply_lora(model, args):
     peft_model = get_peft_model(model, config)
     peft_model.print_trainable_parameters()
     return peft_model
+
+
+def load_causal_lm(model_name_or_path: str, trust_remote_code: bool = False):
+    """Load either a regular HF checkpoint or a local PEFT adapter directory."""
+    adapter_config_path = Path(model_name_or_path) / "adapter_config.json"
+    if adapter_config_path.exists():
+        peft_config = PeftConfig.from_pretrained(model_name_or_path)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            peft_config.base_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+        )
+        return PeftModel.from_pretrained(
+            base_model,
+            model_name_or_path,
+            is_trainable=True,
+        )
+    return AutoModelForCausalLM.from_pretrained(
+        model_name_or_path, trust_remote_code=trust_remote_code
+    )
 
 
 def build_stage(args, tokenizer):
@@ -247,9 +270,7 @@ def build_stage(args, tokenizer):
         args.xlsum_dir, args.bactrian_dir, args.languages,
         args.bactrian_validation_ratio, args.seed,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path, trust_remote_code=args.trust_remote_code
-    )
+    model = load_causal_lm(args.model_name_or_path, args.trust_remote_code)
     model = apply_lora(model, args)
     return dataset, model, InstructionDataCollator(
         tokenizer, args.max_length, args.prompt_format, args.enable_thinking,
@@ -396,17 +417,17 @@ def main() -> None:
     )
     trainer.train()
     trainer.save_state()
-    export_model = model.lm if args.stage == "alignment" else model
-    if isinstance(export_model, PeftModel):
-        # Export a regular HF checkpoint so Stage 2 can load Stage 1 directly.
-        export_model = export_model.merge_and_unload()
-    # Gradient checkpointing requires cache=False during training, but the final
-    # exported causal LM should default back to fast KV-cached generation.
-    if hasattr(export_model, "gradient_checkpointing_disable"):
-        export_model.gradient_checkpointing_disable()
-    export_model.config.use_cache = True
-    export_model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    # export_model = model.lm if args.stage == "alignment" else model
+    # # Gradient checkpointing requires cache=False during training, but the final
+    # # exported adapter/model should default back to fast KV-cached generation.
+    # if hasattr(export_model, "gradient_checkpointing_disable"):
+    #     export_model.gradient_checkpointing_disable()
+    # export_model.config.use_cache = True
+    # # Route the final save through Trainer. For Stage 1, our _save override
+    # # delegates to model.lm.save_pretrained (adapter only); Stage 2 uses the
+    # # standard Trainer PEFT save path.
+    # trainer.save_model(args.output_dir)
+    # tokenizer.save_pretrained(args.output_dir)
 
 
 if __name__ == "__main__":
