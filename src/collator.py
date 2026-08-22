@@ -233,7 +233,7 @@ class InstructionDataCollator:
                 enable_thinking=self.enable_thinking,
             )
         return self.tokenizer(
-            instruction_prompt(user), add_special_tokens=True
+            instruction_prompt(instruction, input_text), add_special_tokens=True
         )["input_ids"]
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:

@@ -28,6 +28,24 @@ def language_name(language_code: str) -> str:
     return LANGUAGE_NAMES.get(normalized, str(language_code).strip())
 
 
+ALPACA_PROMPT = (
+    "Below is an instruction that describes a task, paired with an input "
+    "that provides further context. Write a response that appropriately "
+    "completes the request.\n\n"
+    "### Instruction:\n{instruction}\n\n"
+    "### Input:\n{input}\n\n"
+    "### Response:\n"
+)
+
+ALPACA_INPUT_PREFIX = (
+    "Below is an instruction that describes a task, paired with an input "
+    "that provides further context. Write a response that appropriately "
+    "completes the request.\n\n"
+    "### Instruction:\n{instruction}\n\n"
+    "### Input:\n"
+)
+
+
 TRANSLATION_INSTRUCTION_TEMPLATES = (
     "Translate this text from {src_lang} to {tgt_lang}.",
     "Convert this sentence from {src_lang} to {tgt_lang}.",
@@ -56,10 +74,10 @@ def translation_instruction(
         src_lang=language_name(source_lang),
         tgt_lang=language_name(target_lang),
     )
-    return f"{instruction}\nSource:\n"
+    return ALPACA_INPUT_PREFIX.format(instruction=instruction)
 
 
-TRANSLATION_TARGET_MARKER = "\nTranslation:\n"
+TRANSLATION_TARGET_MARKER = "\n\n### Response:\n"
 
 
 def summarization_instruction(language: str) -> str:
@@ -70,5 +88,5 @@ def instruction_user_prompt(instruction: str, input_text: str) -> str:
     return instruction if not input_text else f"{instruction}\n\nInput:\n{input_text}"
 
 
-def instruction_prompt(user_prompt: str) -> str:
-    return f"### Instruction:\n{user_prompt}\n\n### Response:\n"
+def instruction_prompt(instruction: str, input_text: str = "") -> str:
+    return ALPACA_PROMPT.format(instruction=instruction, input=input_text)
