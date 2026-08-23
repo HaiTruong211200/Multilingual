@@ -1,0 +1,8 @@
+torch>=2.1
+transformers>=4.46
+accelerate>=0.28
+datasets>=2.18
+sentencepiece>=0.2
+safetensors>=0.4
+tensorboard>=2.14
+pytest>=8.0
