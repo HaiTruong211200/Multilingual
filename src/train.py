@@ -104,27 +104,25 @@ class ComponentLoggingTrainer(Trainer):
             return super().log(logs)
         return super().log(logs, start_time)
 
-    def _save(self, output_dir=None, state_dict=None):
-        """Save Stage 1 through the wrapped LM so PEFT/tied weights stay valid."""
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Save only the nested Stage 1 LM/adapter, not the outer wrapper."""
         if self.stage != "alignment":
-            return super()._save(output_dir, state_dict)
+            return super().save_model(output_dir, _internal_call=_internal_call)
 
         output_dir = output_dir or self.args.output_dir
+        if not self.args.should_save:
+            return
         os.makedirs(output_dir, exist_ok=True)
         unwrapped = self.accelerator.unwrap_model(self.model)
         language_model = unwrapped.lm
-
-        # PeftModel.save_pretrained writes adapter weights only. A regular HF LM
-        # writes its config and understands tied embed/lm_head weights, unlike
-        # safetensors.save_file on the outer alignment wrapper's raw state_dict.
         language_model.save_pretrained(
             output_dir,
             safe_serialization=self.args.save_safetensors,
         )
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
         LOGGER.info(
-            "Saved Stage 1 checkpoint via %s.save_pretrained to %s",
-            type(language_model).__name__, output_dir,
+            "Saved Stage 1 adapter via overridden save_model() to %s",
+            output_dir,
         )
 
 
@@ -417,17 +415,12 @@ def main() -> None:
     )
     trainer.train()
     trainer.save_state()
-    # export_model = model.lm if args.stage == "alignment" else model
-    # # Gradient checkpointing requires cache=False during training, but the final
-    # # exported adapter/model should default back to fast KV-cached generation.
-    # if hasattr(export_model, "gradient_checkpointing_disable"):
-    #     export_model.gradient_checkpointing_disable()
-    # export_model.config.use_cache = True
-    # # Route the final save through Trainer. For Stage 1, our _save override
-    # # delegates to model.lm.save_pretrained (adapter only); Stage 2 uses the
-    # # standard Trainer PEFT save path.
-    # trainer.save_model(args.output_dir)
-    # tokenizer.save_pretrained(args.output_dir)
+    export_model = model.lm if args.stage == "alignment" else model
+    if hasattr(export_model, "gradient_checkpointing_disable"):
+        export_model.gradient_checkpointing_disable()
+    export_model.config.use_cache = True
+    trainer.save_model(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
 
 
 if __name__ == "__main__":
