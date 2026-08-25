@@ -7,12 +7,14 @@ import os
 from pathlib import Path
 from collections import defaultdict
 import torch
+import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 
 from .collator import InstructionDataCollator, MultilingualDataCollator
 from .model import MultilingualAlignmentModel
+from .layer_scheduler import POTSAStyleLayerScheduler
 from .prepare_data import (
     load_instruction_dataset,
     load_parallel_dataset,
@@ -30,9 +32,21 @@ class ComponentLoggingTrainer(Trainer):
         "weighted_contrastive_loss", "weighted_ot_loss",
     )
 
-    def __init__(self, *args, stage: str, **kwargs):
+    def __init__(self, *args, stage: str, layer_scheduler=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.stage = stage
+        self.layer_scheduler = layer_scheduler
+        self._scheduler_activation_step = 0
+        self._scheduler_history = {
+            "steps": [],
+            "selected_layers": [],
+            "next_layers": [],
+            "task_losses": [],
+            "contrastive_losses": [],
+            "total_losses": [],
+            "rewards": [],
+            "q_values": [],
+        }
         # The alignment wrapper accepts **kwargs for compatibility but does not
         # consume num_items_in_batch when reducing NTP/CL/OT. Tell Trainer not to
         # pass or assume handling of that argument. For the standard HF model in
@@ -61,6 +75,29 @@ class ComponentLoggingTrainer(Trainer):
                 value = outputs.get(key)
                 if value is not None:
                     self._sums[mode][key] += float(value.float().mean())
+            if mode == "train" and self.layer_scheduler is not None:
+                selected_layer = self.layer_scheduler.current_layer
+                task_loss = float(outputs.ntp_loss.float().mean())
+                reward = self.layer_scheduler.observe(selected_layer, task_loss)
+                state = self.layer_scheduler.states[selected_layer]
+                self._sums[mode]["scheduler_layer"] += float(selected_layer)
+                self._sums[mode]["scheduler_q_value"] += state.q_value
+                if reward is not None:
+                    self._sums[mode]["scheduler_reward"] += reward
+                next_layer = self.layer_scheduler.sample_next(
+                    self.state.global_step + 1
+                )
+                self._record_scheduler_history(
+                    selected_layer=selected_layer,
+                    next_layer=next_layer,
+                    task_loss=task_loss,
+                    contrastive_loss=float(outputs.contrastive_loss.float().mean()),
+                    total_loss=float(loss.detach().float().mean()),
+                    reward=reward,
+                )
+                self.accelerator.unwrap_model(model).align_layer = (
+                    self.layer_scheduler.current_layer
+                )
         else:
             self._sums[mode]["ntp_loss"] += float(loss.detach().float().mean())
         self._counts[mode] += 1
@@ -78,6 +115,55 @@ class ComponentLoggingTrainer(Trainer):
                 attentions=outputs.attentions,
             )
         return loss, outputs
+
+    def _record_scheduler_history(
+        self,
+        selected_layer,
+        next_layer,
+        task_loss,
+        contrastive_loss,
+        total_loss,
+        reward,
+    ):
+        """Keep compact per-activation scheduler history in RAM."""
+        self._scheduler_activation_step += 1
+        if not self.is_world_process_zero():
+            return
+        states = self.layer_scheduler.states
+        history = self._scheduler_history
+        history["steps"].append(self.state.global_step)
+        history["selected_layers"].append(selected_layer)
+        history["next_layers"].append(next_layer)
+        history["task_losses"].append(task_loss)
+        history["contrastive_losses"].append(contrastive_loss)
+        history["total_losses"].append(total_loss)
+        history["rewards"].append(float("nan") if reward is None else reward)
+        history["q_values"].append(
+            [states[layer].q_value for layer in self.layer_scheduler.candidate_layers]
+        )
+
+    def _save_scheduler_history(self, output_dir):
+        """Write compact tensor columns once after training finishes."""
+        if not self._scheduler_history["steps"] or not self.is_world_process_zero():
+            return
+        history = self._scheduler_history
+        compact_history = {
+            "candidate_layers": torch.tensor(
+                self.layer_scheduler.candidate_layers, dtype=torch.int16
+            ),
+            "steps": torch.tensor(history["steps"], dtype=torch.int64),
+            "selected_layers": torch.tensor(history["selected_layers"], dtype=torch.int16),
+            "next_layers": torch.tensor(history["next_layers"], dtype=torch.int16),
+            "task_losses": torch.tensor(history["task_losses"], dtype=torch.float32),
+            "contrastive_losses": torch.tensor(
+                history["contrastive_losses"], dtype=torch.float32
+            ),
+            "total_losses": torch.tensor(history["total_losses"], dtype=torch.float32),
+            "rewards": torch.tensor(history["rewards"], dtype=torch.float32),
+            "q_values": torch.tensor(history["q_values"], dtype=torch.float32),
+        }
+        os.makedirs(output_dir, exist_ok=True)
+        torch.save(compact_history, os.path.join(output_dir, "scheduler_history.pt"))
 
     def log(self, logs, start_time=None):
         mode = "eval" if any(key.startswith("eval_") for key in logs) else "train"
@@ -106,10 +192,12 @@ class ComponentLoggingTrainer(Trainer):
 
     def save_model(self, output_dir=None, _internal_call=False):
         """Save only the nested Stage 1 LM/adapter, not the outer wrapper."""
+        output_dir = output_dir or self.args.output_dir
+        if not _internal_call:
+            self._save_scheduler_history(output_dir)
         if self.stage != "alignment":
             return super().save_model(output_dir, _internal_call=_internal_call)
 
-        output_dir = output_dir or self.args.output_dir
         if not self.args.should_save:
             return
         os.makedirs(output_dir, exist_ok=True)
@@ -120,6 +208,11 @@ class ComponentLoggingTrainer(Trainer):
             safe_serialization=self.args.save_safetensors,
         )
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+        if self.layer_scheduler is not None:
+            torch.save(
+                self.layer_scheduler.state_dict(),
+                os.path.join(output_dir, "layer_scheduler.pt"),
+            )
         LOGGER.info(
             "Saved Stage 1 adapter via overridden save_model() to %s",
             output_dir,
@@ -128,6 +221,7 @@ class ComponentLoggingTrainer(Trainer):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", help="Optional YAML config; CLI values override it.")
     parser.add_argument("--stage", required=True, choices=["alignment", "instruction"])
     parser.add_argument("--model_name_or_path", required=True)
     parser.add_argument("--output_dir", required=True)
@@ -152,6 +246,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ot_weight", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--align_layer", type=int, default=-1)
+    parser.add_argument(
+        "--candidate_layers",
+        default=None,
+        help="Comma-separated hidden-state indices; enables reward-guided scheduling.",
+    )
+    parser.add_argument("--reward_ema_rho", type=float, default=0.1)
+    parser.add_argument("--ucb_beta", type=float, default=0.5)
+    parser.add_argument("--layer_temperature", type=float, default=1.0)
+    parser.add_argument("--layer_warmup_steps", type=int, default=100)
+    parser.add_argument(
+        "--force_each_layer_once",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--attention_mass_weight", type=float, default=0.5)
     parser.add_argument("--sinkhorn_epsilon", type=float, default=0.1)
     parser.add_argument("--sinkhorn_iterations", type=int, default=20)
@@ -196,6 +304,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--report_to", choices=["none", "tensorboard"], default="tensorboard"
     )
+    config_args, _ = parser.parse_known_args()
+    if config_args.config:
+        config_path = Path(config_args.config)
+        with config_path.open("r", encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file) or {}
+        if not isinstance(config, dict):
+            raise ValueError("The YAML config root must be a mapping")
+
+        flattened_config = {}
+        for section, values in config.items():
+            if isinstance(values, dict):
+                flattened_config.update(values)
+            else:
+                flattened_config[section] = values
+        valid_keys = {action.dest for action in parser._actions}
+        unknown_keys = sorted(set(flattened_config) - valid_keys)
+        if unknown_keys:
+            raise ValueError(f"Unknown YAML config keys: {unknown_keys}")
+        parser.set_defaults(**flattened_config)
     return parser.parse_args()
 
 
@@ -353,6 +480,45 @@ def main() -> None:
             "--prompt_format chat was requested but tokenizer.chat_template is empty."
         )
     dataset, model, collator = build_stage(args, tokenizer)
+    layer_scheduler = None
+    if args.stage == "alignment" and args.candidate_layers:
+        candidate_values = (
+            args.candidate_layers
+            if isinstance(args.candidate_layers, (list, tuple))
+            else args.candidate_layers.split(",")
+        )
+        candidate_layers = tuple(
+            int(value.strip()) if isinstance(value, str) else int(value)
+            for value in candidate_values
+            if not isinstance(value, str) or value.strip()
+        )
+        hidden_state_count = model.config.num_hidden_layers + 1
+        invalid_layers = [
+            layer for layer in candidate_layers
+            if not -hidden_state_count <= layer < hidden_state_count
+        ]
+        if invalid_layers:
+            raise ValueError(
+                f"Invalid candidate hidden-state indices {invalid_layers}; "
+                f"expected [{-hidden_state_count}, {hidden_state_count - 1}]"
+            )
+        layer_scheduler = POTSAStyleLayerScheduler(
+            candidate_layers=candidate_layers,
+            ema_rho=args.reward_ema_rho,
+            ucb_beta=args.ucb_beta,
+            temperature=args.layer_temperature,
+            warmup_steps=args.layer_warmup_steps,
+            force_each_layer_once=args.force_each_layer_once,
+            seed=args.seed,
+        )
+        model.align_layer = layer_scheduler.current_layer
+        LOGGER.info(
+            "Reward-guided layer scheduling | candidates=%s rho=%g beta=%g "
+            "temperature=%g warmup=%d force_once=%s",
+            candidate_layers, args.reward_ema_rho, args.ucb_beta,
+            args.layer_temperature, args.layer_warmup_steps,
+            args.force_each_layer_once,
+        )
     LOGGER.info(
         "Dataset built | train=%d | validation=%d | columns=%s",
         len(dataset["train"]), len(dataset["validation"]),
@@ -412,6 +578,7 @@ def main() -> None:
         train_dataset=dataset["train"], eval_dataset=dataset["validation"],
         data_collator=collator,
         stage=args.stage,
+        layer_scheduler=layer_scheduler,
     )
     trainer.train()
     trainer.save_state()

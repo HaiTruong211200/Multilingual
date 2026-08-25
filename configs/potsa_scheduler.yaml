@@ -1,0 +1,24 @@
+# Dynamic POTSA-style alignment.
+# Run: CONFIG_FILE=configs/potsa_scheduler.yaml ./scripts/run_stage1_alignment.sh
+alignment:
+  # Weight of contrastive alignment loss in total training loss.
+  contrastive_weight: 0.1
+  # InfoNCE temperature (not the layer-sampling temperature below).
+  temperature: 0.07
+  # Keep 0.0 to disable token-level OT alignment.
+  ot_weight: 0.0
+
+scheduler:
+  # A non-empty list ENABLES reward-guided dynamic layer selection.
+  # hidden_states[0] is the embedding output; hidden_states[i] is block i output.
+  candidate_layers: [8, 10, 12, 14, 16, 18]
+  # Q <- (1-rho) * Q + rho * reward.
+  reward_ema_rho: 0.1
+  # Strength of the UCB exploration bonus. Set 0 for reward-only sampling.
+  ucb_beta: 0.5
+  # Softmax temperature used to sample a layer from UCB utilities.
+  layer_temperature: 1.0
+  # Uniform random selection before reward-guided sampling starts.
+  layer_warmup_steps: 100
+  # Visit every candidate at least once before normal sampling.
+  force_each_layer_once: true

@@ -1,0 +1,13 @@
+# Fixed-layer alignment: reward, EMA, UCB, and layer sampling are all disabled.
+# Run: CONFIG_FILE=configs/fixed_layer_alignment.yaml ./scripts/run_stage1_alignment.sh
+alignment:
+  # Always use this hidden-state index for contrastive alignment.
+  # hidden_states[0] is embeddings; hidden_states[i] is block i output.
+  align_layer: 12
+  contrastive_weight: 0.1
+  temperature: 0.07
+  ot_weight: 0.0
+
+scheduler:
+  # null is the switch that DISABLES the POTSA-style scheduler.
+  candidate_layers: null

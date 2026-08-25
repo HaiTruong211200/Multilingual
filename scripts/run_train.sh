@@ -21,10 +21,6 @@ ARGS=(
   --direction "$DIRECTION"
   --prompt_format "${PROMPT_FORMAT:-plain}"
   --training_mode "${TRAINING_MODE:-finetune}"
-  --align_layer "${ALIGN_LAYER:--1}"
-  --contrastive_weight "${CONTRASTIVE_WEIGHT:-0.0}"
-  --temperature "${CONTRASTIVE_TEMPERATURE:-0.07}"
-  --ot_weight "${OT_WEIGHT:-0.0}"
   --attention_mass_weight "${ATTENTION_MASS_WEIGHT:-0.5}"
   --learning_rate "${LEARNING_RATE:-2e-5}"
   --epochs "${EPOCHS:-3}"
@@ -50,6 +46,39 @@ ARGS=(
   --warmup_steps "${WARMUP_STEPS:-0}"
   --report_to "${REPORT_TO:-tensorboard}"
 )
+
+if [[ -n "${CONFIG_FILE:-}" ]]; then
+  ARGS+=(--config "$CONFIG_FILE")
+fi
+
+if [[ -n "${ALIGN_LAYER:-}" ]]; then
+  ARGS+=(--align_layer "$ALIGN_LAYER")
+fi
+
+if [[ -n "${CONTRASTIVE_WEIGHT:-}" ]]; then
+  ARGS+=(--contrastive_weight "$CONTRASTIVE_WEIGHT")
+fi
+if [[ -n "${CONTRASTIVE_TEMPERATURE:-}" ]]; then
+  ARGS+=(--temperature "$CONTRASTIVE_TEMPERATURE")
+fi
+if [[ -n "${OT_WEIGHT:-}" ]]; then
+  ARGS+=(--ot_weight "$OT_WEIGHT")
+fi
+
+if [[ -n "${CANDIDATE_LAYERS:-}" ]]; then
+  ARGS+=(
+    --candidate_layers "$CANDIDATE_LAYERS"
+    --reward_ema_rho "${REWARD_EMA_RHO:-0.1}"
+    --ucb_beta "${UCB_BETA:-0.5}"
+    --layer_temperature "${LAYER_TEMPERATURE:-1.0}"
+    --layer_warmup_steps "${LAYER_WARMUP_STEPS:-100}"
+  )
+  if [[ "${FORCE_EACH_LAYER_ONCE:-true}" == "true" ]]; then
+    ARGS+=(--force_each_layer_once)
+  else
+    ARGS+=(--no-force_each_layer_once)
+  fi
+fi
 
 if [[ "${ENABLE_THINKING:-false}" == "true" ]]; then
   ARGS+=(--enable_thinking)

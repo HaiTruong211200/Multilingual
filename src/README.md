@@ -45,6 +45,57 @@ mean pooling over each span, an in-batch cosine-similarity matrix, `LogSoftmax`
 over dimension 0, and diagonal positive-pair NLL scaled by 1/2. Use
 `--align_layer -1` (default) or another hidden-state index to select its layer.
 
+The default Stage 1 script reads `configs/potsa_scheduler.yaml`. Edit that file
+to configure alignment and reward-guided scheduling, or pass another file with
+`CONFIG_FILE=configs/my_experiment.yaml`. CLI/environment values still override
+the YAML values. To select the contrastive layer dynamically without YAML, pass
+e.g. `--candidate_layers 8,10,12,14`. After each training activation, the scheduler
+uses `previous_ntp_loss - current_ntp_loss` as reward, maintains its EMA, adds a
+UCB exploration bonus, and samples the next layer with temperature-controlled
+softmax. Configure it with `--reward_ema_rho`, `--ucb_beta`,
+`--layer_temperature`, and `--layer_warmup_steps`. Without
+`--candidate_layers`, the existing fixed `--align_layer` behavior is unchanged.
+During training, compact per-activation columns are kept entirely in RAM. The
+final explicit model save writes them once to `<output_dir>/scheduler_history.pt`;
+periodic checkpoints do not write this history. The artifact contains steps,
+selected and next layers, task/contrastive/total losses, raw rewards, candidate
+layers, and the Q-value vector for every activation. TensorBoard logging remains
+available for lightweight aggregate views during training.
+
+### Dynamic versus fixed alignment layer
+
+Dynamic reward-guided scheduling is the default Stage 1 configuration:
+
+```bash
+CONFIG_FILE=configs/potsa_scheduler.yaml \
+  ./scripts/run_stage1_alignment.sh
+```
+
+Its `scheduler.candidate_layers` is a non-empty list, so training computes the
+loss-change reward, updates EMA/UCB state, and samples the next alignment layer.
+The final output includes `layer_scheduler.pt` and `scheduler_history.pt`.
+
+For a fixed alignment layer with no reward computation, use the provided fixed
+configuration:
+
+```bash
+CONFIG_FILE=configs/fixed_layer_alignment.yaml \
+  ./scripts/run_stage1_alignment.sh
+```
+
+Set `alignment.align_layer` in that file to the required hidden-state index. Its
+`scheduler.candidate_layers: null` disables scheduler construction completely;
+there is no reward, EMA, UCB, layer sampling, or scheduler history artifact.
+
+Environment variables can override YAML values. For example, this runs fixed
+layer 16 without editing the file:
+
+```bash
+CONFIG_FILE=configs/fixed_layer_alignment.yaml \
+ALIGN_LAYER=16 \
+./scripts/run_stage1_alignment.sh
+```
+
 OT uses token-pair cosine distance as its transport cost. Its source and target
 marginals come from the attention at the alignment layer: attention is averaged
 over heads, accumulated over target queries, restricted to each span, and
