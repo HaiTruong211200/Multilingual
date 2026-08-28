@@ -10,6 +10,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
+from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
 
 from .collator import InstructionDataCollator, MultilingualDataCollator
 from .model import MultilingualAlignmentModel
@@ -119,10 +120,47 @@ class ComponentLoggingTrainer(Trainer):
             output_dir,
             safe_serialization=self.args.save_safetensors,
         )
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
         LOGGER.info(
             "Saved Stage 1 adapter via overridden save_model() to %s",
             output_dir,
+        )
+
+    def _load_best_model(self):
+        """Load the best Stage 1 PEFT checkpoint into the nested language model."""
+        if self.stage != "alignment":
+            return super()._load_best_model()
+
+        checkpoint = self.state.best_model_checkpoint
+        if checkpoint is None:
+            LOGGER.warning("No best Stage 1 checkpoint was recorded; keeping final weights.")
+            return
+
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        language_model = unwrapped.lm
+        if not isinstance(language_model, PeftModel):
+            raise TypeError(
+                "Stage 1 best-checkpoint loading expects a PeftModel in model.lm. "
+                "Disable load_best_model_at_end for full fine-tuning."
+            )
+
+        adapter_name = language_model.active_adapter
+        if isinstance(adapter_name, (list, tuple)):
+            adapter_name = adapter_name[0]
+        adapter_weights = load_peft_weights(checkpoint, device="cpu")
+        load_result = set_peft_model_state_dict(
+            language_model,
+            adapter_weights,
+            adapter_name=adapter_name,
+        )
+        LOGGER.info(
+            "Loaded best Stage 1 adapter from %s into adapter=%s | missing=%d unexpected=%d",
+            checkpoint,
+            adapter_name,
+            len(getattr(load_result, "missing_keys", [])),
+            len(getattr(load_result, "unexpected_keys", [])),
         )
 
 
@@ -412,6 +450,7 @@ def main() -> None:
         train_dataset=dataset["train"], eval_dataset=dataset["validation"],
         data_collator=collator,
         stage=args.stage,
+        processing_class=tokenizer,
     )
     trainer.train()
     trainer.save_state()
