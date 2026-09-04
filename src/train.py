@@ -191,8 +191,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--align_layer", type=int, default=-1)
     parser.add_argument("--attention_mass_weight", type=float, default=0.5)
+    parser.add_argument("--ot_solver", choices=["sinkhorn", "ipot"], default="sinkhorn")
     parser.add_argument("--sinkhorn_epsilon", type=float, default=0.1)
     parser.add_argument("--sinkhorn_iterations", type=int, default=20)
+    parser.add_argument("--ipot_beta", type=float, default=0.5)
+    parser.add_argument("--ipot_iterations", type=int, default=50)
+    parser.add_argument("--ipot_inner_iterations", type=int, default=1)
     parser.add_argument("--attn_implementation", default="eager", choices=["eager", "sdpa"])
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--epochs", type=float, default=3.0)
@@ -293,8 +297,12 @@ def build_stage(args, tokenizer):
             temperature=args.temperature,
             align_layer=args.align_layer,
             attention_mass_weight=args.attention_mass_weight,
+            ot_solver=args.ot_solver,
             sinkhorn_epsilon=args.sinkhorn_epsilon,
             sinkhorn_iterations=args.sinkhorn_iterations,
+            ipot_beta=args.ipot_beta,
+            ipot_iterations=args.ipot_iterations,
+            ipot_inner_iterations=args.ipot_inner_iterations,
             attn_implementation=args.attn_implementation,
             trust_remote_code=args.trust_remote_code,
         )
@@ -367,10 +375,20 @@ def main() -> None:
             args.training_mode, args.contrastive_weight, args.ot_weight,
         )
         LOGGER.info(
-            "Alignment layer=%d | contrastive_temperature=%g | attention_mass_weight=%g | Sinkhorn eps=%g iterations=%d",
+            "Alignment layer=%d | contrastive_temperature=%g | attention_mass_weight=%g | OT solver=%s",
             args.align_layer, args.temperature, args.attention_mass_weight,
-            args.sinkhorn_epsilon, args.sinkhorn_iterations,
+            args.ot_solver,
         )
+        if args.ot_solver == "sinkhorn":
+            LOGGER.info(
+                "Sinkhorn epsilon=%g | iterations=%d",
+                args.sinkhorn_epsilon, args.sinkhorn_iterations,
+            )
+        else:
+            LOGGER.info(
+                "IPOT beta=%g | outer_iterations=%d | inner_iterations=%d",
+                args.ipot_beta, args.ipot_iterations, args.ipot_inner_iterations,
+            )
     else:
         LOGGER.info(
             "Data XLSum=%s | Bactrian=%s | languages=%s | mode=%s | loss=NTP",

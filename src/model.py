@@ -30,7 +30,7 @@ def masked_mean(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 class MultilingualAlignmentModel(nn.Module):
-    """A shared causal LM trained with NTP + InfoNCE + Sinkhorn OT."""
+    """A shared causal LM trained with NTP + InfoNCE + token-level OT."""
 
     def __init__(
         self,
@@ -40,8 +40,12 @@ class MultilingualAlignmentModel(nn.Module):
         temperature: float = 0.07,
         align_layer: int = -1,
         attention_mass_weight: float = 0.5,
+        ot_solver: str = "sinkhorn",
         sinkhorn_epsilon: float = 0.1,
         sinkhorn_iterations: int = 20,
+        ipot_beta: float = 0.5,
+        ipot_iterations: int = 50,
+        ipot_inner_iterations: int = 1,
         attn_implementation: str = "eager",
         trust_remote_code: bool = False,
     ):
@@ -59,8 +63,18 @@ class MultilingualAlignmentModel(nn.Module):
         if not 0.0 <= attention_mass_weight <= 1.0:
             raise ValueError("attention_mass_weight must be between 0 and 1")
         self.attention_mass_weight = attention_mass_weight
+        if ot_solver not in {"sinkhorn", "ipot"}:
+            raise ValueError("ot_solver must be 'sinkhorn' or 'ipot'")
+        if sinkhorn_epsilon <= 0.0 or ipot_beta <= 0.0:
+            raise ValueError("sinkhorn_epsilon and ipot_beta must be positive")
+        if sinkhorn_iterations < 1 or ipot_iterations < 1 or ipot_inner_iterations < 1:
+            raise ValueError("all OT iteration counts must be positive")
+        self.ot_solver = ot_solver
         self.sinkhorn_epsilon = sinkhorn_epsilon
         self.sinkhorn_iterations = sinkhorn_iterations
+        self.ipot_beta = ipot_beta
+        self.ipot_iterations = ipot_iterations
+        self.ipot_inner_iterations = ipot_inner_iterations
 
     def gradient_checkpointing_enable(self, **kwargs):
         return self.lm.gradient_checkpointing_enable(**kwargs)
@@ -130,6 +144,61 @@ class MultilingualAlignmentModel(nn.Module):
             costs.append((transport * cost).sum())
         return torch.stack(costs).mean()
 
+    def _ipot_ot(
+        self,
+        src: torch.Tensor,
+        tgt: torch.Tensor,
+        src_mask: torch.Tensor,
+        tgt_mask: torch.Tensor,
+        source_mass: torch.Tensor,
+        target_mass: torch.Tensor,
+    ) -> torch.Tensor:
+        """IPOT with cosine cost and arbitrary attention-derived marginals.
+
+        IPOT repeatedly solves an inexact KL-proximal transport subproblem. In
+        contrast to entropic Sinkhorn, beta controls the proximal update rather
+        than permanently smoothing the final transport plan.
+        """
+        costs = []
+        for x, y, mx, my, ax, by in zip(
+            src, tgt, src_mask.bool(), tgt_mask.bool(), source_mass, target_mass
+        ):
+            # Perform transport iterations in fp32 to avoid fp16/bf16 underflow.
+            x = F.normalize(x[mx].float(), dim=-1)
+            y = F.normalize(y[my].float(), dim=-1)
+            cost = 1.0 - x @ y.T
+            a = ax[mx].to(dtype=cost.dtype)
+            b = by[my].to(dtype=cost.dtype)
+            a = a / a.sum().clamp_min(1e-8)
+            b = b / b.sum().clamp_min(1e-8)
+
+            proximal_kernel = torch.exp(-cost / self.ipot_beta).clamp_min(1e-8)
+            # Start from a feasible independent coupling. Each outer iteration
+            # multiplies the kernel by the previous transport plan.
+            transport = a[:, None] * b[None, :]
+            v = torch.ones_like(b)
+            for _ in range(self.ipot_iterations):
+                q = proximal_kernel * transport
+                for _ in range(self.ipot_inner_iterations):
+                    u = a / (q @ v).clamp_min(1e-8)
+                    v = b / (q.T @ u).clamp_min(1e-8)
+                transport = u[:, None] * q * v[None, :]
+
+            costs.append((transport * cost).sum())
+        return torch.stack(costs).mean()
+
+    def _optimal_transport(
+        self,
+        src: torch.Tensor,
+        tgt: torch.Tensor,
+        src_mask: torch.Tensor,
+        tgt_mask: torch.Tensor,
+        source_mass: torch.Tensor,
+        target_mass: torch.Tensor,
+    ) -> torch.Tensor:
+        solver = self._ipot_ot if self.ot_solver == "ipot" else self._sinkhorn_ot
+        return solver(src, tgt, src_mask, tgt_mask, source_mass, target_mass)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -195,7 +264,7 @@ class MultilingualAlignmentModel(nn.Module):
                 target_mass = self._mixed_mass(
                     received_attention * target_mask, target_mask
                 )
-                ot = self._sinkhorn_ot(
+                ot = self._optimal_transport(
                     final_hidden, final_hidden, source_mask, target_mask,
                     source_mass, target_mass,
                 )
