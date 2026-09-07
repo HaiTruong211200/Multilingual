@@ -33,6 +33,8 @@ ARGS=(
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-8}"
   --sinkhorn_iterations "${SINKHORN_ITERATIONS:-20}"
   --sinkhorn_epsilon "${SINKHORN_EPSILON:-0.1}"
+  --sinkhorn_epsilon_schedule "${SINKHORN_EPSILON_SCHEDULE:-constant}"
+  --sinkhorn_epsilon_end "${SINKHORN_EPSILON_END:-0.01}"
   --ipot_beta "${IPOT_BETA:-0.5}"
   --ipot_iterations "${IPOT_ITERATIONS:-50}"
   --ipot_inner_iterations "${IPOT_INNER_ITERATIONS:-1}"

@@ -70,6 +70,7 @@ class MultilingualAlignmentModel(nn.Module):
         if sinkhorn_iterations < 1 or ipot_iterations < 1 or ipot_inner_iterations < 1:
             raise ValueError("all OT iteration counts must be positive")
         self.ot_solver = ot_solver
+        self.initial_sinkhorn_epsilon = sinkhorn_epsilon
         self.sinkhorn_epsilon = sinkhorn_epsilon
         self.sinkhorn_iterations = sinkhorn_iterations
         self.ipot_beta = ipot_beta

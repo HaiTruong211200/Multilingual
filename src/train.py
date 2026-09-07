@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 from pathlib import Path
 from collections import defaultdict
@@ -31,9 +32,18 @@ class ComponentLoggingTrainer(Trainer):
         "weighted_contrastive_loss", "weighted_ot_loss",
     )
 
-    def __init__(self, *args, stage: str, **kwargs):
+    def __init__(
+        self,
+        *args,
+        stage: str,
+        sinkhorn_epsilon_schedule: str = "constant",
+        sinkhorn_epsilon_end: float = 0.01,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.stage = stage
+        self.sinkhorn_epsilon_schedule = sinkhorn_epsilon_schedule
+        self.sinkhorn_epsilon_end = sinkhorn_epsilon_end
         # The alignment wrapper accepts **kwargs for compatibility but does not
         # consume num_items_in_batch when reducing NTP/CL/OT. Tell Trainer not to
         # pass or assume handling of that argument. For the standard HF model in
@@ -43,7 +53,29 @@ class ComponentLoggingTrainer(Trainer):
         self._sums = {"train": defaultdict(float), "eval": defaultdict(float)}
         self._counts = {"train": 0, "eval": 0}
 
+    def _update_sinkhorn_epsilon(self, model) -> None:
+        """Apply the configured epsilon schedule before a training forward pass."""
+        if self.stage != "alignment" or self.sinkhorn_epsilon_schedule == "constant":
+            return
+
+        unwrapped = self.accelerator.unwrap_model(model)
+        if unwrapped.ot_solver != "sinkhorn":
+            return
+
+        # global_step counts optimizer updates (rather than micro-batches), so
+        # this remains correct with gradient accumulation and after resuming.
+        last_step = max(self.state.max_steps - 1, 1)
+        progress = min(max(self.state.global_step / last_step, 0.0), 1.0)
+        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        unwrapped.sinkhorn_epsilon = (
+            self.sinkhorn_epsilon_end
+            + (unwrapped.initial_sinkhorn_epsilon - self.sinkhorn_epsilon_end)
+            * cosine_factor
+        )
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if model.training:
+            self._update_sinkhorn_epsilon(model)
         # Delegate the actual loss computation to Hugging Face Trainer so label
         # smoothing, custom loss functions, item-count normalization, and future
         # Trainer behavior remain intact. This override only observes the output.
@@ -101,6 +133,10 @@ class ComponentLoggingTrainer(Trainer):
             #     )
             self._sums[mode].clear()
             self._counts[mode] = 0
+        if self.stage == "alignment":
+            unwrapped = self.accelerator.unwrap_model(self.model)
+            if unwrapped.ot_solver == "sinkhorn":
+                logs[f"{mode}/sinkhorn_epsilon"] = unwrapped.sinkhorn_epsilon
         if start_time is None:
             return super().log(logs)
         return super().log(logs, start_time)
@@ -193,6 +229,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention_mass_weight", type=float, default=0.5)
     parser.add_argument("--ot_solver", choices=["sinkhorn", "ipot"], default="sinkhorn")
     parser.add_argument("--sinkhorn_epsilon", type=float, default=0.1)
+    parser.add_argument(
+        "--sinkhorn_epsilon_schedule",
+        choices=["constant", "cosine"],
+        default="constant",
+        help="Keep epsilon fixed or cosine-decay it during training.",
+    )
+    parser.add_argument(
+        "--sinkhorn_epsilon_end",
+        type=float,
+        default=0.01,
+        help="Final epsilon for --sinkhorn_epsilon_schedule cosine.",
+    )
     parser.add_argument("--sinkhorn_iterations", type=int, default=20)
     parser.add_argument("--ipot_beta", type=float, default=0.5)
     parser.add_argument("--ipot_iterations", type=int, default=50)
@@ -330,6 +378,15 @@ def main() -> None:
         raise ValueError("logging_steps, save_steps, and eval_steps must be positive")
     if args.warmup_steps < 0:
         raise ValueError("warmup_steps cannot be negative")
+    if args.sinkhorn_epsilon_end <= 0.0:
+        raise ValueError("sinkhorn_epsilon_end must be positive")
+    if (
+        args.sinkhorn_epsilon_schedule == "cosine"
+        and args.sinkhorn_epsilon_end > args.sinkhorn_epsilon
+    ):
+        raise ValueError(
+            "sinkhorn_epsilon_end must not exceed sinkhorn_epsilon for cosine decay"
+        )
     if args.save_strategy != args.eval_strategy:
         raise ValueError(
             "save_strategy and eval_strategy must match when load_best_model_at_end=True"
@@ -381,8 +438,9 @@ def main() -> None:
         )
         if args.ot_solver == "sinkhorn":
             LOGGER.info(
-                "Sinkhorn epsilon=%g | iterations=%d",
-                args.sinkhorn_epsilon, args.sinkhorn_iterations,
+                "Sinkhorn epsilon=%g | schedule=%s | end=%g | iterations=%d",
+                args.sinkhorn_epsilon, args.sinkhorn_epsilon_schedule,
+                args.sinkhorn_epsilon_end, args.sinkhorn_iterations,
             )
         else:
             LOGGER.info(
@@ -468,6 +526,8 @@ def main() -> None:
         train_dataset=dataset["train"], eval_dataset=dataset["validation"],
         data_collator=collator,
         stage=args.stage,
+        sinkhorn_epsilon_schedule=args.sinkhorn_epsilon_schedule,
+        sinkhorn_epsilon_end=args.sinkhorn_epsilon_end,
         processing_class=tokenizer,
     )
     trainer.train()

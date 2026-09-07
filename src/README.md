@@ -102,6 +102,13 @@ Language selection is independent across stages:
 # vi-en, and zh-en. Use "all" to load every pair.
 LANGUAGE_PAIRS=vi-en,th-en ./scripts/run_stage1_alignment.sh
 
+# Cosine-decay Sinkhorn epsilon from 0.1 to 0.01. The default schedule is
+# "constant", which keeps SINKHORN_EPSILON unchanged throughout training.
+SINKHORN_EPSILON=0.1 \
+SINKHORN_EPSILON_SCHEDULE=cosine \
+SINKHORN_EPSILON_END=0.01 \
+  ./scripts/run_stage1_alignment.sh
+
 # Load only the selected XLSum/Bactrian languages.
 LANGUAGES=vi,th,en \
 MODEL_NAME_OR_PATH=outputs/stage1-multilingual-alignment \
