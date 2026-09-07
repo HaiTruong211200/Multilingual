@@ -39,6 +39,7 @@ class MultilingualAlignmentModel(nn.Module):
         ot_weight: float = 0.0,
         temperature: float = 0.07,
         align_layer: int = -1,
+        alignment_forward_mode: str = "joint",
         attention_mass_weight: float = 0.5,
         ot_solver: str = "sinkhorn",
         sinkhorn_epsilon: float = 0.1,
@@ -60,6 +61,11 @@ class MultilingualAlignmentModel(nn.Module):
         self.ot_weight = ot_weight
         self.temperature = temperature
         self.align_layer = align_layer
+        if alignment_forward_mode not in {"joint", "independent"}:
+            raise ValueError(
+                "alignment_forward_mode must be 'joint' or 'independent'"
+            )
+        self.alignment_forward_mode = alignment_forward_mode
         if not 0.0 <= attention_mass_weight <= 1.0:
             raise ValueError("attention_mass_weight must be between 0 and 1")
         self.attention_mass_weight = attention_mass_weight
@@ -124,26 +130,72 @@ class MultilingualAlignmentModel(nn.Module):
         source_mass: torch.Tensor,
         target_mass: torch.Tensor,
     ) -> torch.Tensor:
-        """Entropic OT with cosine cost and attention-derived marginals."""
-        costs = []
-        for x, y, mx, my, ax, by in zip(
-            src, tgt, src_mask.bool(), tgt_mask.bool(), source_mass, target_mass
-        ):
-            # Sinkhorn is particularly sensitive to bf16/fp16 underflow.
-            x = F.normalize(x[mx].float(), dim=-1)
-            y = F.normalize(y[my].float(), dim=-1)
-            cost = 1.0 - x @ y.T
-            # Attention scores have already been normalized over their spans.
-            a = ax[mx].to(dtype=cost.dtype)
-            b = by[my].to(dtype=cost.dtype)
-            kernel = torch.exp(-cost / self.sinkhorn_epsilon).clamp_min(1e-8)
-            u, v = torch.ones_like(a), torch.ones_like(b)
-            for _ in range(self.sinkhorn_iterations):
-                u = a / (kernel @ v).clamp_min(1e-8)
-                v = b / (kernel.T @ u).clamp_min(1e-8)
-            transport = u[:, None] * kernel * v[None, :]
-            costs.append((transport * cost).sum())
-        return torch.stack(costs).mean()
+        """Entropic OT with cosine cost and attention-derived marginals.
+
+        Fully batched (no python loop over B) and numerically stable: Sinkhorn
+        dual updates are done in log-space via logsumexp, which stays stable
+        even for small eps / bf16-fp16 upstream tensors (unlike exp(-C/eps)
+        followed by clamping, which under/overflows easily).
+        """
+        B, Ls, _ = src.shape
+        Lt = tgt.shape[1]
+        device = src.device
+
+        src_mask = src_mask.bool()
+        tgt_mask = tgt_mask.bool()
+
+        # --- cosine cost, computed in fp32 regardless of upstream dtype ---
+        x = F.normalize(src.float(), dim=-1, eps=1e-8)
+        y = F.normalize(tgt.float(), dim=-1, eps=1e-8)
+        cost = 1.0 - torch.bmm(x, y.transpose(1, 2))  # [B, Ls, Lt]
+        cost = torch.nan_to_num(cost, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        # --- marginals: mask out padding, guard fully-empty samples ---
+        a = source_mass.float() * src_mask
+        b = target_mass.float() * tgt_mask
+        a_sum = a.sum(dim=-1, keepdim=True)
+        b_sum = b.sum(dim=-1, keepdim=True)
+        valid = (a_sum.squeeze(-1) > 1e-8) & (b_sum.squeeze(-1) > 1e-8)  # [B]
+        a = a / a_sum.clamp_min(1e-8)
+        b = b / b_sum.clamp_min(1e-8)
+
+        # log(0) = -inf for padded/empty entries — this is the correct signal
+        # to exclude them from logsumexp, so don't clamp before the log.
+        log_a = torch.where(a > 0, torch.log(a.clamp_min(1e-38)), a.new_full((), float("-inf")))
+        log_b = torch.where(b > 0, torch.log(b.clamp_min(1e-38)), b.new_full((), float("-inf")))
+
+        log_K = -cost / self.sinkhorn_epsilon
+        log_K = log_K.masked_fill(~src_mask.unsqueeze(-1), float("-inf"))
+        log_K = log_K.masked_fill(~tgt_mask.unsqueeze(1), float("-inf"))
+
+        # --- log-domain Sinkhorn iterations ---
+        log_u = torch.zeros(B, Ls, device=device, dtype=torch.float32)
+        log_v = torch.zeros(B, Lt, device=device, dtype=torch.float32)
+        for _ in range(self.sinkhorn_iterations):
+            log_u = log_a - torch.logsumexp(log_K + log_v.unsqueeze(1), dim=-1)
+            log_u = torch.nan_to_num(
+                log_u, nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
+            )
+            # Sanitize log_u before using it in the log_v update; otherwise NaNs
+            # from padded rows poison every target column in the same sample.
+            log_v = log_b - torch.logsumexp(
+                log_K.transpose(-1, -2) + log_u.unsqueeze(1), dim=-1
+            )
+            log_v = torch.nan_to_num(
+                log_v, nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
+            )
+
+        log_P = log_u.unsqueeze(-1) + log_K + log_v.unsqueeze(1)
+        transport = torch.exp(log_P)
+        transport = torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
+        # Fully-empty samples: force the plan to exactly zero rather than trust
+        # whatever fell out of the -inf/-inf arithmetic above.
+        transport = transport * valid.view(B, 1, 1).to(transport.dtype)
+
+        per_sample_cost = (transport * cost).sum(dim=(1, 2))  # [B]
+        if not valid.any():
+            return src.new_zeros(())
+        return per_sample_cost[valid].mean()
 
     def _ipot_ot(
         self,
@@ -159,34 +211,74 @@ class MultilingualAlignmentModel(nn.Module):
         IPOT repeatedly solves an inexact KL-proximal transport subproblem. In
         contrast to entropic Sinkhorn, beta controls the proximal update rather
         than permanently smoothing the final transport plan.
+
+        Fully batched (no python loop over B) and numerically stable: all dual
+        updates are done in log-space via logsumexp, which stays stable even for
+        small beta / bf16-fp16 upstream tensors (unlike exp(-C/beta) followed by
+        clamping, which under/overflows easily).
         """
-        costs = []
-        for x, y, mx, my, ax, by in zip(
-            src, tgt, src_mask.bool(), tgt_mask.bool(), source_mass, target_mass
-        ):
-            # Perform transport iterations in fp32 to avoid fp16/bf16 underflow.
-            x = F.normalize(x[mx].float(), dim=-1)
-            y = F.normalize(y[my].float(), dim=-1)
-            cost = 1.0 - x @ y.T
-            a = ax[mx].to(dtype=cost.dtype)
-            b = by[my].to(dtype=cost.dtype)
-            a = a / a.sum().clamp_min(1e-8)
-            b = b / b.sum().clamp_min(1e-8)
+        B, Ls, _ = src.shape
+        Lt = tgt.shape[1]
+        device = src.device
 
-            proximal_kernel = torch.exp(-cost / self.ipot_beta).clamp_min(1e-8)
-            # Start from a feasible independent coupling. Each outer iteration
-            # multiplies the kernel by the previous transport plan.
-            transport = a[:, None] * b[None, :]
-            v = torch.ones_like(b)
-            for _ in range(self.ipot_iterations):
-                q = proximal_kernel * transport
-                for _ in range(self.ipot_inner_iterations):
-                    u = a / (q @ v).clamp_min(1e-8)
-                    v = b / (q.T @ u).clamp_min(1e-8)
-                transport = u[:, None] * q * v[None, :]
+        src_mask = src_mask.bool()
+        tgt_mask = tgt_mask.bool()
 
-            costs.append((transport * cost).sum())
-        return torch.stack(costs).mean()
+        # --- cosine cost, computed in fp32 regardless of upstream dtype ---
+        x = F.normalize(src.float(), dim=-1, eps=1e-8)
+        y = F.normalize(tgt.float(), dim=-1, eps=1e-8)
+        cost = 1.0 - torch.bmm(x, y.transpose(1, 2))  # [B, Ls, Lt]
+        cost = torch.nan_to_num(cost, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        # --- marginals: mask out padding, guard fully-empty samples ---
+        a = source_mass.float() * src_mask
+        b = target_mass.float() * tgt_mask
+        a_sum = a.sum(dim=-1, keepdim=True)
+        b_sum = b.sum(dim=-1, keepdim=True)
+        valid = (a_sum.squeeze(-1) > 1e-8) & (b_sum.squeeze(-1) > 1e-8)  # [B]
+        a = a / a_sum.clamp_min(1e-8)
+        b = b / b_sum.clamp_min(1e-8)
+
+        # log(0) = -inf for padded/empty entries — the correct signal to exclude
+        # them from logsumexp, so don't clamp before the log.
+        log_a = torch.where(a > 0, torch.log(a.clamp_min(1e-38)), a.new_full((), float("-inf")))
+        log_b = torch.where(b > 0, torch.log(b.clamp_min(1e-38)), b.new_full((), float("-inf")))
+
+        log_proximal_kernel = -cost / self.ipot_beta
+        log_proximal_kernel = log_proximal_kernel.masked_fill(~src_mask.unsqueeze(-1), float("-inf"))
+        log_proximal_kernel = log_proximal_kernel.masked_fill(~tgt_mask.unsqueeze(1), float("-inf"))
+
+        # Feasible independent coupling to start from: log(a_i * b_j) = log_a_i + log_b_j.
+        # Padding is already -inf via log_a/log_b, no extra masking needed here.
+        log_transport = log_a.unsqueeze(-1) + log_b.unsqueeze(1)  # [B, Ls, Lt]
+
+        log_v = torch.zeros(B, Lt, device=device, dtype=torch.float32)
+        for _ in range(self.ipot_iterations):
+            log_q = log_proximal_kernel + log_transport
+            for _ in range(self.ipot_inner_iterations):
+                log_u = log_a - torch.logsumexp(log_q + log_v.unsqueeze(1), dim=-1)
+                log_u = torch.nan_to_num(
+                    log_u, nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
+                )
+                log_v = log_b - torch.logsumexp(
+                    log_q.transpose(-1, -2) + log_u.unsqueeze(1), dim=-1
+                )
+                log_v = torch.nan_to_num(
+                    log_v, nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
+                )
+            log_transport = log_u.unsqueeze(-1) + log_q + log_v.unsqueeze(1)
+            log_transport = torch.nan_to_num(log_transport, nan=float("-inf"), posinf=float("-inf"))
+
+        transport = torch.exp(log_transport)
+        transport = torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
+        # Fully-empty samples: force the plan to exactly zero rather than trust
+        # whatever fell out of the -inf/-inf arithmetic above.
+        transport = transport * valid.view(B, 1, 1).to(transport.dtype)
+
+        per_sample_cost = (transport * cost).sum(dim=(1, 2))  # [B]
+        if not valid.any():
+            return src.new_zeros(())
+        return per_sample_cost[valid].mean()
 
     def _optimal_transport(
         self,
@@ -209,17 +301,24 @@ class MultilingualAlignmentModel(nn.Module):
         source_end_positions: Optional[torch.Tensor] = None,
         target_start_positions: Optional[torch.Tensor] = None,
         target_end_positions: Optional[torch.Tensor] = None,
+        alignment_source_input_ids: Optional[torch.Tensor] = None,
+        alignment_source_attention_mask: Optional[torch.Tensor] = None,
+        alignment_source_content_mask: Optional[torch.Tensor] = None,
+        alignment_target_input_ids: Optional[torch.Tensor] = None,
+        alignment_target_attention_mask: Optional[torch.Tensor] = None,
+        alignment_target_content_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         compute_contrastive = self.contrastive_weight != 0.0
         compute_ot = self.ot_weight != 0.0
         compute_alignment = compute_contrastive or compute_ot
+        joint_alignment = compute_alignment and self.alignment_forward_mode == "joint"
         output = self.lm(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
-            output_hidden_states=compute_alignment,
-            output_attentions=compute_ot,
+            output_hidden_states=joint_alignment,
+            output_attentions=compute_ot and joint_alignment,
             return_dict=True,
         )
         if source_start_positions is None or target_start_positions is None:
@@ -229,11 +328,15 @@ class MultilingualAlignmentModel(nn.Module):
         contrastive = ntp_loss.new_zeros(())
         ot = ntp_loss.new_zeros(())
 
-        if compute_alignment:
+        if joint_alignment:
             final_hidden = output.hidden_states[-1]
             positions = torch.arange(
                 final_hidden.size(1), device=final_hidden.device
             ).unsqueeze(0)
+            source_start_positions = source_start_positions.to(final_hidden.device)
+            source_end_positions = source_end_positions.to(final_hidden.device)
+            target_start_positions = target_start_positions.to(final_hidden.device)
+            target_end_positions = target_end_positions.to(final_hidden.device)
             source_mask = (positions >= source_start_positions[:, None]) & (
                 positions < source_end_positions[:, None]
             )
@@ -267,7 +370,93 @@ class MultilingualAlignmentModel(nn.Module):
                 )
                 ot = self._optimal_transport(
                     final_hidden, final_hidden, source_mask, target_mask,
-                    source_mass, target_mass,
+                    source_mass.to(final_hidden.device),
+                    target_mass.to(final_hidden.device),
+                )
+        elif compute_alignment:
+            independent_tensors = (
+                alignment_source_input_ids,
+                alignment_source_attention_mask,
+                alignment_source_content_mask,
+                alignment_target_input_ids,
+                alignment_target_attention_mask,
+                alignment_target_content_mask,
+            )
+            if any(tensor is None for tensor in independent_tensors):
+                raise ValueError(
+                    "independent alignment requires source/target input_ids, "
+                    "attention_mask, and content_mask from the collator"
+                )
+            source_output = self.lm(
+                input_ids=alignment_source_input_ids,
+                attention_mask=alignment_source_attention_mask,
+                output_hidden_states=True,
+                output_attentions=compute_ot,
+                return_dict=True,
+            )
+            target_output = self.lm(
+                input_ids=alignment_target_input_ids,
+                attention_mask=alignment_target_attention_mask,
+                output_hidden_states=True,
+                output_attentions=compute_ot,
+                return_dict=True,
+            )
+            source_final = source_output.hidden_states[-1]
+            target_final = target_output.hidden_states[-1]
+            source_mask = alignment_source_content_mask.to(
+                device=source_final.device, dtype=torch.bool
+            )
+            target_mask = alignment_target_content_mask.to(
+                device=target_final.device, dtype=torch.bool
+            )
+
+            if compute_contrastive:
+                source_contrastive = source_output.hidden_states[self.align_layer]
+                target_contrastive = target_output.hidden_states[self.align_layer]
+                contrastive = self._contrastive(
+                    masked_mean(
+                        source_contrastive,
+                        source_mask.to(source_contrastive.device),
+                    ),
+                    masked_mean(
+                        target_contrastive,
+                        target_mask.to(target_contrastive.device),
+                    ),
+                )
+
+            if compute_ot:
+                attention_layer = (
+                    self.align_layer
+                    if self.align_layer < 0
+                    else max(self.align_layer - 1, 0)
+                )
+                source_attention = source_output.attentions[attention_layer].mean(dim=1)
+                target_attention = target_output.attentions[attention_layer].mean(dim=1)
+                source_attention_mask = source_mask.to(source_attention.device)
+                target_attention_mask = target_mask.to(target_attention.device)
+                source_received = (
+                    source_attention.float()
+                    * source_attention_mask.unsqueeze(-1)
+                ).sum(dim=1)
+                target_received = (
+                    target_attention.float()
+                    * target_attention_mask.unsqueeze(-1)
+                ).sum(dim=1)
+                source_mass = self._mixed_mass(
+                    source_received * source_attention_mask,
+                    source_attention_mask,
+                )
+                target_mass = self._mixed_mass(
+                    target_received * target_attention_mask,
+                    target_attention_mask,
+                )
+                ot = self._optimal_transport(
+                    source_final,
+                    target_final.to(source_final.device),
+                    source_mask,
+                    target_mask.to(source_final.device),
+                    source_mass.to(source_final.device),
+                    target_mass.to(source_final.device),
                 )
         # Usually all three losses are already colocated. Explicit movement is
         # required for model/tensor parallel layouts where alignment hidden

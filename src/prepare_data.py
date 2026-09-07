@@ -61,6 +61,24 @@ def prepare_alignment_dataset(
             add_special_tokens=add_special_tokens,
         )
 
+        # Alternative alignment view: source and target are complete,
+        # independently tokenized sequences. They are prepared here (never in
+        # the collator/model) so training can run two separate forward passes.
+        independent_source = tokenizer(
+            source,
+            add_special_tokens=True,
+            padding=False,
+            truncation=False,
+            return_special_tokens_mask=True,
+        )
+        independent_target = tokenizer(
+            target,
+            add_special_tokens=True,
+            padding=False,
+            truncation=False,
+            return_special_tokens_mask=True,
+        )
+
         # Tokenize four progressively longer prefixes. For plain prompts these
         # correspond to: instruction; instruction+source;
         # instruction+source+target marker; and the complete prompt.
@@ -106,6 +124,14 @@ def prepare_alignment_dataset(
             "source_end_positions": source_end,
             "target_start_positions": target_start,
             "target_end_positions": target_end,
+            "alignment_source_input_ids": independent_source["input_ids"],
+            "alignment_source_content_mask": [
+                1 - value for value in independent_source["special_tokens_mask"]
+            ],
+            "alignment_target_input_ids": independent_target["input_ids"],
+            "alignment_target_content_mask": [
+                1 - value for value in independent_target["special_tokens_mask"]
+            ],
         }
 
     return DatasetDict({

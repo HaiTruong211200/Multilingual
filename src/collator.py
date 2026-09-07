@@ -105,6 +105,39 @@ class MultilingualDataCollator:
                 input_ids[index, :length] = torch.tensor(item["input_ids"])
                 attention_mask[index, :length] = 1
                 labels[index, :length] = torch.tensor(item["labels"])
+
+            def pad_alignment_side(ids_key: str, content_key: str):
+                side_width = max(len(item[ids_key]) for item in features)
+                side_ids = torch.full(
+                    (len(features), side_width),
+                    self.tokenizer.pad_token_id,
+                    dtype=torch.long,
+                )
+                side_attention = torch.zeros_like(side_ids)
+                side_content = torch.zeros_like(side_ids, dtype=torch.bool)
+                for row_index, item in enumerate(features):
+                    side_length = len(item[ids_key])
+                    side_ids[row_index, :side_length] = torch.tensor(item[ids_key])
+                    side_attention[row_index, :side_length] = 1
+                    side_content[row_index, :side_length] = torch.tensor(
+                        item[content_key], dtype=torch.bool
+                    )
+                return side_ids, side_attention, side_content
+
+            (
+                alignment_source_input_ids,
+                alignment_source_attention_mask,
+                alignment_source_content_mask,
+            ) = pad_alignment_side(
+                "alignment_source_input_ids", "alignment_source_content_mask"
+            )
+            (
+                alignment_target_input_ids,
+                alignment_target_attention_mask,
+                alignment_target_content_mask,
+            ) = pad_alignment_side(
+                "alignment_target_input_ids", "alignment_target_content_mask"
+            )
             return {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
@@ -121,6 +154,12 @@ class MultilingualDataCollator:
                 "target_end_positions": torch.tensor(
                     [item["target_end_positions"] for item in features]
                 ),
+                "alignment_source_input_ids": alignment_source_input_ids,
+                "alignment_source_attention_mask": alignment_source_attention_mask,
+                "alignment_source_content_mask": alignment_source_content_mask,
+                "alignment_target_input_ids": alignment_target_input_ids,
+                "alignment_target_attention_mask": alignment_target_attention_mask,
+                "alignment_target_content_mask": alignment_target_content_mask,
             }
         raise ValueError(
             "MultilingualDataCollator expects a dataset processed by "

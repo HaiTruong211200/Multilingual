@@ -22,6 +22,7 @@ ARGS=(
   --prompt_format "${PROMPT_FORMAT:-plain}"
   --training_mode "${TRAINING_MODE:-finetune}"
   --align_layer "${ALIGN_LAYER:--1}"
+  --alignment_forward_mode "${ALIGNMENT_FORWARD_MODE:-joint}"
   --contrastive_weight "${CONTRASTIVE_WEIGHT:-0.0}"
   --temperature "${CONTRASTIVE_TEMPERATURE:-0.07}"
   --ot_weight "${OT_WEIGHT:-0.0}"
