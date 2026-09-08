@@ -227,13 +227,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--align_layer", type=int, default=-1)
     parser.add_argument(
-        "--alignment_forward_mode",
+        "--contrastive_forward_mode",
         choices=["joint", "independent"],
         default="joint",
-        help=(
-            "joint slices source/target from the full prompt forward; independent "
-            "runs two additional source-only and target-only forwards."
-        ),
+        help="Representation view used only by the contrastive objective.",
+    )
+    # OT has one extra representation choice. Keeping this argument separate
+    # prevents bidirectional conditional alignment from leaking into CL.
+    parser.add_argument(
+        "--ot_forward_mode",
+        choices=["joint", "independent", "bidirectional"],
+        default="joint",
+        help="Representation view used only by the optimal-transport objective.",
     )
     parser.add_argument("--attention_mass_weight", type=float, default=0.5)
     parser.add_argument("--ot_solver", choices=["sinkhorn", "ipot"], default="sinkhorn")
@@ -353,7 +358,8 @@ def build_stage(args, tokenizer):
             ot_weight=args.ot_weight,
             temperature=args.temperature,
             align_layer=args.align_layer,
-            alignment_forward_mode=args.alignment_forward_mode,
+            contrastive_forward_mode=args.contrastive_forward_mode,
+            ot_forward_mode=args.ot_forward_mode,
             attention_mass_weight=args.attention_mass_weight,
             ot_solver=args.ot_solver,
             sinkhorn_epsilon=args.sinkhorn_epsilon,
@@ -442,8 +448,8 @@ def main() -> None:
             args.training_mode, args.contrastive_weight, args.ot_weight,
         )
         LOGGER.info(
-            "Alignment forward=%s | layer=%d | contrastive_temperature=%g | attention_mass_weight=%g | OT solver=%s",
-            args.alignment_forward_mode, args.align_layer,
+            "Contrastive forward=%s | OT forward=%s | layer=%d | contrastive_temperature=%g | attention_mass_weight=%g | OT solver=%s",
+            args.contrastive_forward_mode, args.ot_forward_mode, args.align_layer,
             args.temperature, args.attention_mass_weight,
             args.ot_solver,
         )

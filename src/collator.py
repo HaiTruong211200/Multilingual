@@ -106,6 +106,11 @@ class MultilingualDataCollator:
                 attention_mask[index, :length] = 1
                 labels[index, :length] = torch.tensor(item["labels"])
 
+            # --------------------------------------------------------------
+            # Independent view: pad source-only and target-only sequences
+            # separately. Their widths can differ and neither is forced to the
+            # width of the full causal-LM prompt.
+            # --------------------------------------------------------------
             def pad_alignment_side(ids_key: str, content_key: str):
                 side_width = max(len(item[ids_key]) for item in features)
                 side_ids = torch.full(
@@ -138,6 +143,24 @@ class MultilingualDataCollator:
             ) = pad_alignment_side(
                 "alignment_target_input_ids", "alignment_target_content_mask"
             )
+            # --------------------------------------------------------------
+            # Bidirectional OT view: pad the reversed translation prompt
+            # (instruction target->source, target, source). The stored interval
+            # points only to its response/source span H_x|y.
+            # --------------------------------------------------------------
+            reverse_width = max(len(item["reverse_input_ids"]) for item in features)
+            reverse_input_ids = torch.full(
+                (len(features), reverse_width),
+                self.tokenizer.pad_token_id,
+                dtype=torch.long,
+            )
+            reverse_attention_mask = torch.zeros_like(reverse_input_ids)
+            for row_index, item in enumerate(features):
+                reverse_length = len(item["reverse_input_ids"])
+                reverse_input_ids[row_index, :reverse_length] = torch.tensor(
+                    item["reverse_input_ids"]
+                )
+                reverse_attention_mask[row_index, :reverse_length] = 1
             return {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
@@ -160,6 +183,14 @@ class MultilingualDataCollator:
                 "alignment_target_input_ids": alignment_target_input_ids,
                 "alignment_target_attention_mask": alignment_target_attention_mask,
                 "alignment_target_content_mask": alignment_target_content_mask,
+                "reverse_input_ids": reverse_input_ids,
+                "reverse_attention_mask": reverse_attention_mask,
+                "reverse_target_start_positions": torch.tensor(
+                    [item["reverse_target_start_positions"] for item in features]
+                ),
+                "reverse_target_end_positions": torch.tensor(
+                    [item["reverse_target_end_positions"] for item in features]
+                ),
             }
         raise ValueError(
             "MultilingualDataCollator expects a dataset processed by "

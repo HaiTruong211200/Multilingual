@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 
 from .prompts import (
+    TRANSLATION_INSTRUCTION_TEMPLATES,
     TRANSLATION_TARGET_MARKER,
     summarization_instruction,
     translation_instruction,
@@ -27,7 +29,10 @@ def prepare_alignment_dataset(
 
     def tokenize_row(row: dict) -> dict:
         source, target = str(row["source"]), str(row["target"])
-        instruction = translation_instruction(row["source_lang"], row["target_lang"])
+        template_index = random.randrange(len(TRANSLATION_INSTRUCTION_TEMPLATES))
+        instruction = translation_instruction(
+            row["source_lang"], row["target_lang"], template_index=template_index
+        )
         if prompt_format == "chat":
             if not tokenizer.chat_template:
                 raise ValueError("prompt_format='chat' requires tokenizer.chat_template")
@@ -79,6 +84,73 @@ def prepare_alignment_dataset(
             return_special_tokens_mask=True,
         )
 
+        # Bidirectional conditional view:
+        # forward prompt yields H_target|source, while this reversed prompt
+        # yields H_source|target. Only the reversed target span is needed by
+        # the alignment model; it does not receive NTP labels.
+        reverse_instruction = translation_instruction(
+            row["target_lang"], row["source_lang"], template_index=template_index
+        )
+        if prompt_format == "chat":
+            reverse_user_content = reverse_instruction + target
+            reverse_rendered = tokenizer.apply_chat_template(
+                [
+                    {"role": "user", "content": reverse_user_content},
+                    {"role": "assistant", "content": source},
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=enable_thinking,
+            )
+            reverse_target_char_start = reverse_rendered.rfind(source)
+            if reverse_target_char_start < 0:
+                raise ValueError("Chat template changed reversed target text")
+            reverse_target_char_end = reverse_target_char_start + len(source)
+            reverse_add_special_tokens = False
+        else:
+            reverse_rendered = (
+                reverse_instruction + target + TRANSLATION_TARGET_MARKER + source
+            )
+            reverse_target_char_start = (
+                len(reverse_instruction) + len(target) + len(TRANSLATION_TARGET_MARKER)
+            )
+            reverse_target_char_end = reverse_target_char_start + len(source)
+            reverse_add_special_tokens = True
+
+        reverse_encoded = tokenizer(
+            reverse_rendered,
+            add_special_tokens=reverse_add_special_tokens,
+            padding=False,
+            truncation=False,
+        )
+
+        def reverse_token_length(text: str) -> int:
+            return len(tokenizer(
+                text,
+                add_special_tokens=reverse_add_special_tokens,
+                padding=False,
+                truncation=False,
+                return_tensors=None,
+            )["input_ids"])
+
+        # Prefix lengths recover the exact [start, end) token interval of x in
+        # the reversed prompt. EOS is appended only after these boundaries are
+        # computed, so it never participates in bidirectional OT.
+        reverse_target_start = reverse_token_length(
+            reverse_rendered[:reverse_target_char_start]
+        )
+        reverse_target_end = reverse_token_length(
+            reverse_rendered[:reverse_target_char_end]
+        )
+        if reverse_target_end <= reverse_target_start:
+            raise ValueError("Reversed target has an empty token interval")
+        reverse_input_ids = reverse_encoded["input_ids"]
+        reverse_eos_id = tokenizer.eos_token_id
+        if reverse_eos_id is not None and (
+            not reverse_input_ids or reverse_input_ids[-1] != reverse_eos_id
+        ):
+            reverse_input_ids.append(reverse_eos_id)
+
         # Tokenize four progressively longer prefixes. For plain prompts these
         # correspond to: instruction; instruction+source;
         # instruction+source+target marker; and the complete prompt.
@@ -112,6 +184,11 @@ def prepare_alignment_dataset(
                 f"Translation sample has {len(input_ids)} tokens, exceeding "
                 f"model_max_length={model_limit}"
             )
+        if model_limit < 10**9 and len(reverse_input_ids) > model_limit:
+            raise ValueError(
+                f"Reversed translation sample has {len(reverse_input_ids)} "
+                f"tokens, exceeding model_max_length={model_limit}"
+            )
         labels = (
             [-100] * target_start + input_ids[target_start:]
             if training_mode == "finetune"
@@ -132,6 +209,9 @@ def prepare_alignment_dataset(
             "alignment_target_content_mask": [
                 1 - value for value in independent_target["special_tokens_mask"]
             ],
+            "reverse_input_ids": reverse_input_ids,
+            "reverse_target_start_positions": reverse_target_start,
+            "reverse_target_end_positions": reverse_target_end,
         }
 
     return DatasetDict({

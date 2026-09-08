@@ -39,7 +39,8 @@ class MultilingualAlignmentModel(nn.Module):
         ot_weight: float = 0.0,
         temperature: float = 0.07,
         align_layer: int = -1,
-        alignment_forward_mode: str = "joint",
+        contrastive_forward_mode: str = "joint",
+        ot_forward_mode: str = "joint",
         attention_mass_weight: float = 0.5,
         ot_solver: str = "sinkhorn",
         sinkhorn_epsilon: float = 0.1,
@@ -61,11 +62,16 @@ class MultilingualAlignmentModel(nn.Module):
         self.ot_weight = ot_weight
         self.temperature = temperature
         self.align_layer = align_layer
-        if alignment_forward_mode not in {"joint", "independent"}:
+        if contrastive_forward_mode not in {"joint", "independent"}:
             raise ValueError(
-                "alignment_forward_mode must be 'joint' or 'independent'"
+                "contrastive_forward_mode must be 'joint' or 'independent'"
             )
-        self.alignment_forward_mode = alignment_forward_mode
+        if ot_forward_mode not in {"joint", "independent", "bidirectional"}:
+            raise ValueError(
+                "ot_forward_mode must be 'joint', 'independent', or 'bidirectional'"
+            )
+        self.contrastive_forward_mode = contrastive_forward_mode
+        self.ot_forward_mode = ot_forward_mode
         if not 0.0 <= attention_mass_weight <= 1.0:
             raise ValueError("attention_mass_weight must be between 0 and 1")
         self.attention_mass_weight = attention_mass_weight
@@ -307,18 +313,44 @@ class MultilingualAlignmentModel(nn.Module):
         alignment_target_input_ids: Optional[torch.Tensor] = None,
         alignment_target_attention_mask: Optional[torch.Tensor] = None,
         alignment_target_content_mask: Optional[torch.Tensor] = None,
+        reverse_input_ids: Optional[torch.Tensor] = None,
+        reverse_attention_mask: Optional[torch.Tensor] = None,
+        reverse_target_start_positions: Optional[torch.Tensor] = None,
+        reverse_target_end_positions: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        # ------------------------------------------------------------------
+        # Block 1: Decide which representations are actually required.
+        #
+        # The full prompt forward is always needed for NTP. Hidden states from
+        # that forward are retained only when CL uses joint or OT uses
+        # joint/bidirectional. Source-only and target-only forwards are shared
+        # when both CL and OT choose independent.
+        # ------------------------------------------------------------------
         compute_contrastive = self.contrastive_weight != 0.0
         compute_ot = self.ot_weight != 0.0
-        compute_alignment = compute_contrastive or compute_ot
-        joint_alignment = compute_alignment and self.alignment_forward_mode == "joint"
+        need_joint = (
+            compute_contrastive and self.contrastive_forward_mode == "joint"
+        ) or (
+            compute_ot and self.ot_forward_mode in {"joint", "bidirectional"}
+        )
+        need_independent = (
+            compute_contrastive and self.contrastive_forward_mode == "independent"
+        ) or (
+            compute_ot and self.ot_forward_mode == "independent"
+        )
+        # ------------------------------------------------------------------
+        # Block 2: Main causal-LM forward over (instruction, source, target).
+        # This is the only forward that receives labels and therefore the only
+        # one contributing NTP loss.
+        # ------------------------------------------------------------------
         output = self.lm(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
-            output_hidden_states=joint_alignment,
-            output_attentions=compute_ot and joint_alignment,
+            output_hidden_states=need_joint,
+            output_attentions=compute_ot
+            and self.ot_forward_mode in {"joint", "bidirectional"},
             return_dict=True,
         )
         if source_start_positions is None or target_start_positions is None:
@@ -328,7 +360,17 @@ class MultilingualAlignmentModel(nn.Module):
         contrastive = ntp_loss.new_zeros(())
         ot = ntp_loss.new_zeros(())
 
-        if joint_alignment:
+        attention_layer = (
+            self.align_layer if self.align_layer < 0 else max(self.align_layer - 1, 0)
+        )
+
+        # ------------------------------------------------------------------
+        # Block 3: Build source/target masks inside the full prompt.
+        # Intervals are [start, end), so EOS and prompt markers are excluded.
+        # These tensors represent H_x|prompt and H_y|x for joint objectives.
+        # ------------------------------------------------------------------
+        joint_source_mask = joint_target_mask = None
+        if need_joint:
             final_hidden = output.hidden_states[-1]
             positions = torch.arange(
                 final_hidden.size(1), device=final_hidden.device
@@ -337,43 +379,22 @@ class MultilingualAlignmentModel(nn.Module):
             source_end_positions = source_end_positions.to(final_hidden.device)
             target_start_positions = target_start_positions.to(final_hidden.device)
             target_end_positions = target_end_positions.to(final_hidden.device)
-            source_mask = (positions >= source_start_positions[:, None]) & (
+            joint_source_mask = (positions >= source_start_positions[:, None]) & (
                 positions < source_end_positions[:, None]
             )
-            target_mask = (positions >= target_start_positions[:, None]) & (
+            joint_target_mask = (positions >= target_start_positions[:, None]) & (
                 positions < target_end_positions[:, None]
             )
 
-            if compute_contrastive:
-                contrastive_hidden = output.hidden_states[self.align_layer]
-                contrastive = self._contrastive(
-                    masked_mean(contrastive_hidden, source_mask),
-                    masked_mean(contrastive_hidden, target_mask),
-                )
-
-            if compute_ot:
-                # hidden_states[0] is embeddings; attentions[0] is layer 1.
-                attention_layer = (
-                    self.align_layer
-                    if self.align_layer < 0
-                    else max(self.align_layer - 1, 0)
-                )
-                attention = output.attentions[attention_layer].mean(dim=1)
-                received_attention = (
-                    attention.float() * target_mask.unsqueeze(-1)
-                ).sum(dim=1)
-                source_mass = self._mixed_mass(
-                    received_attention * source_mask, source_mask
-                )
-                target_mass = self._mixed_mass(
-                    received_attention * target_mask, target_mask
-                )
-                ot = self._optimal_transport(
-                    final_hidden, final_hidden, source_mask, target_mask,
-                    source_mass.to(final_hidden.device),
-                    target_mass.to(final_hidden.device),
-                )
-        elif compute_alignment:
+        source_output = target_output = None
+        source_mask = target_mask = None
+        if need_independent:
+            # --------------------------------------------------------------
+            # Block 4: Obtain context-independent H_x and H_y.
+            # prepare_data tokenized both complete sentences beforehand and
+            # the collator padded them independently. content_mask removes
+            # BOS/EOS/PAD from pooling and token-level OT.
+            # --------------------------------------------------------------
             independent_tensors = (
                 alignment_source_input_ids,
                 alignment_source_attention_mask,
@@ -384,21 +405,21 @@ class MultilingualAlignmentModel(nn.Module):
             )
             if any(tensor is None for tensor in independent_tensors):
                 raise ValueError(
-                    "independent alignment requires source/target input_ids, "
+                    "independent contrastive/OT requires source/target input_ids, "
                     "attention_mask, and content_mask from the collator"
                 )
             source_output = self.lm(
                 input_ids=alignment_source_input_ids,
                 attention_mask=alignment_source_attention_mask,
                 output_hidden_states=True,
-                output_attentions=compute_ot,
+                output_attentions=compute_ot and self.ot_forward_mode == "independent",
                 return_dict=True,
             )
             target_output = self.lm(
                 input_ids=alignment_target_input_ids,
                 attention_mask=alignment_target_attention_mask,
                 output_hidden_states=True,
-                output_attentions=compute_ot,
+                output_attentions=compute_ot and self.ot_forward_mode == "independent",
                 return_dict=True,
             )
             source_final = source_output.hidden_states[-1]
@@ -410,7 +431,26 @@ class MultilingualAlignmentModel(nn.Module):
                 device=target_final.device, dtype=torch.bool
             )
 
-            if compute_contrastive:
+        # ------------------------------------------------------------------
+        # Block 5: Contrastive objective has exactly two supported views.
+        # - joint:       mean-pool source/target spans from the main prompt.
+        # - independent: mean-pool two separately encoded sentences.
+        # It deliberately has no bidirectional conditional mode.
+        # ------------------------------------------------------------------
+        if compute_contrastive:
+            if self.contrastive_forward_mode == "joint":
+                contrastive_hidden = output.hidden_states[self.align_layer]
+                contrastive = self._contrastive(
+                    masked_mean(
+                        contrastive_hidden,
+                        joint_source_mask.to(contrastive_hidden.device),
+                    ),
+                    masked_mean(
+                        contrastive_hidden,
+                        joint_target_mask.to(contrastive_hidden.device),
+                    ),
+                )
+            else:
                 source_contrastive = source_output.hidden_states[self.align_layer]
                 target_contrastive = target_output.hidden_states[self.align_layer]
                 contrastive = self._contrastive(
@@ -424,12 +464,44 @@ class MultilingualAlignmentModel(nn.Module):
                     ),
                 )
 
-            if compute_ot:
-                attention_layer = (
-                    self.align_layer
-                    if self.align_layer < 0
-                    else max(self.align_layer - 1, 0)
+        # ------------------------------------------------------------------
+        # Block 6: Token-level OT routing.
+        # - joint:         OT(H_x from the prompt, H_y|x).
+        # - independent:   OT(H_x from source-only, H_y from target-only).
+        # - bidirectional: OT(H_y|x, H_x|y), requiring one reverse prompt.
+        #
+        # Marginals mix attention salience with a uniform distribution. The
+        # transport cost itself is cosine distance inside _optimal_transport.
+        # ------------------------------------------------------------------
+        if compute_ot:
+            if self.ot_forward_mode == "joint":
+                # Target queries indicate how much attention each source and
+                # target token receives inside the forward translation prompt.
+                attention = output.attentions[attention_layer].mean(dim=1)
+                attention_source_mask = joint_source_mask.to(attention.device)
+                attention_target_mask = joint_target_mask.to(attention.device)
+                received_attention = (
+                    attention.float() * attention_target_mask.unsqueeze(-1)
+                ).sum(dim=1)
+                source_mass = self._mixed_mass(
+                    received_attention * attention_source_mask,
+                    attention_source_mask,
                 )
+                target_mass = self._mixed_mass(
+                    received_attention * attention_target_mask,
+                    attention_target_mask,
+                )
+                ot = self._optimal_transport(
+                    final_hidden,
+                    final_hidden,
+                    joint_source_mask,
+                    joint_target_mask,
+                    source_mass.to(final_hidden.device),
+                    target_mass.to(final_hidden.device),
+                )
+            elif self.ot_forward_mode == "independent":
+                # No cross-sentence attention exists here. Each marginal is
+                # therefore derived from self-attention in its own sequence.
                 source_attention = source_output.attentions[attention_layer].mean(dim=1)
                 target_attention = target_output.attentions[attention_layer].mean(dim=1)
                 source_attention_mask = source_mask.to(source_attention.device)
@@ -457,6 +529,70 @@ class MultilingualAlignmentModel(nn.Module):
                     target_mask.to(source_final.device),
                     source_mass.to(source_final.device),
                     target_mass.to(source_final.device),
+                )
+            else:
+                # Reverse prompt is (instruction target->source, target, source).
+                # Its target span is x, yielding H_x|y; the forward target span
+                # yields H_y|x. Reverse labels are intentionally not supplied.
+                reverse_tensors = (
+                    reverse_input_ids,
+                    reverse_attention_mask,
+                    reverse_target_start_positions,
+                    reverse_target_end_positions,
+                )
+                if any(tensor is None for tensor in reverse_tensors):
+                    raise ValueError(
+                        "bidirectional OT requires the reversed prompt and its "
+                        "target span from the collator"
+                    )
+                reverse_output = self.lm(
+                    input_ids=reverse_input_ids,
+                    attention_mask=reverse_attention_mask,
+                    output_hidden_states=True,
+                    output_attentions=True,
+                    return_dict=True,
+                )
+                reverse_final = reverse_output.hidden_states[-1]
+                reverse_positions = torch.arange(
+                    reverse_final.size(1), device=reverse_final.device
+                ).unsqueeze(0)
+                reverse_target_mask = (
+                    reverse_positions
+                    >= reverse_target_start_positions.to(reverse_final.device)[:, None]
+                ) & (
+                    reverse_positions
+                    < reverse_target_end_positions.to(reverse_final.device)[:, None]
+                )
+                # Attention mass for each side comes from target queries in its
+                # own directional prompt; instruction/source/EOS remain masked
+                # out of the transport marginals.
+                forward_attention = output.attentions[attention_layer].mean(dim=1)
+                reverse_attention = reverse_output.attentions[attention_layer].mean(dim=1)
+                forward_attention_mask = joint_target_mask.to(forward_attention.device)
+                reverse_attention_mask = reverse_target_mask.to(reverse_attention.device)
+                forward_received = (
+                    forward_attention.float()
+                    * forward_attention_mask.unsqueeze(-1)
+                ).sum(dim=1)
+                reverse_received = (
+                    reverse_attention.float()
+                    * reverse_attention_mask.unsqueeze(-1)
+                ).sum(dim=1)
+                forward_mass = self._mixed_mass(
+                    forward_received * forward_attention_mask,
+                    forward_attention_mask,
+                )
+                reverse_mass = self._mixed_mass(
+                    reverse_received * reverse_attention_mask,
+                    reverse_attention_mask,
+                )
+                ot = self._optimal_transport(
+                    final_hidden,
+                    reverse_final.to(final_hidden.device),
+                    joint_target_mask,
+                    reverse_target_mask.to(final_hidden.device),
+                    forward_mass.to(final_hidden.device),
+                    reverse_mass.to(final_hidden.device),
                 )
         # Usually all three losses are already colocated. Explicit movement is
         # required for model/tensor parallel layouts where alignment hidden
