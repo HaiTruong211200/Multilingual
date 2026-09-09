@@ -136,72 +136,59 @@ class MultilingualAlignmentModel(nn.Module):
         source_mass: torch.Tensor,
         target_mass: torch.Tensor,
     ) -> torch.Tensor:
-        """Entropic OT with cosine cost and attention-derived marginals.
+        with torch.autocast(device_type=src.device.type, enabled=False):
+            a = source_mass.float().masked_fill(~src_mask.bool(), 0.0)
+            b = target_mass.float().masked_fill(~tgt_mask.bool(), 0.0)
 
-        Fully batched (no python loop over B) and numerically stable: Sinkhorn
-        dual updates are done in log-space via logsumexp, which stays stable
-        even for small eps / bf16-fp16 upstream tensors (unlike exp(-C/eps)
-        followed by clamping, which under/overflows easily).
-        """
-        B, Ls, _ = src.shape
-        Lt = tgt.shape[1]
-        device = src.device
+            a_sum = a.sum(-1, keepdim=True)
+            b_sum = b.sum(-1, keepdim=True)
+            valid = (a_sum[:, 0] > 1e-8) & (b_sum[:, 0] > 1e-8)
 
-        src_mask = src_mask.bool()
-        tgt_mask = tgt_mask.bool()
+            if not valid.any():
+                return (
+                    src.float().reshape(-1)[:0].sum()
+                    + tgt.float().reshape(-1)[:0].sum()
+                    + a.reshape(-1)[:0].sum()
+                    + b.reshape(-1)[:0].sum()
+                )
 
-        # --- cosine cost, computed in fp32 regardless of upstream dtype ---
-        x = F.normalize(src.float(), dim=-1, eps=1e-8)
-        y = F.normalize(tgt.float(), dim=-1, eps=1e-8)
-        cost = 1.0 - torch.bmm(x, y.transpose(1, 2))  # [B, Ls, Lt]
-        cost = torch.nan_to_num(cost, nan=0.0, posinf=1e4, neginf=-1e4)
+            # Loại mẫu rỗng và xác định token có mass dương.
+            a = a[valid] / a_sum[valid]
+            b = b[valid] / b_sum[valid]
+            sm, tm = a > 0, b > 0
 
-        # --- marginals: mask out padding, guard fully-empty samples ---
-        a = source_mass.float() * src_mask
-        b = target_mass.float() * tgt_mask
-        a_sum = a.sum(dim=-1, keepdim=True)
-        b_sum = b.sum(dim=-1, keepdim=True)
-        valid = (a_sum.squeeze(-1) > 1e-8) & (b_sum.squeeze(-1) > 1e-8)  # [B]
-        a = a / a_sum.clamp_min(1e-8)
-        b = b / b_sum.clamp_min(1e-8)
+            x = src[valid].float().masked_fill(~sm.unsqueeze(-1), 0.0)
+            y = tgt[valid].float().masked_fill(~tm.unsqueeze(-1), 0.0)
+            x = F.normalize(x, dim=-1, eps=1e-6)
+            y = F.normalize(y, dim=-1, eps=1e-6)
+            cost = (1.0 - torch.bmm(x, y.transpose(1, 2))).clamp(0, 2)
 
-        # log(0) = -inf for padded/empty entries — this is the correct signal
-        # to exclude them from logsumexp, so don't clamp before the log.
-        log_a = torch.where(a > 0, torch.log(a.clamp_min(1e-38)), a.new_full((), float("-inf")))
-        log_b = torch.where(b > 0, torch.log(b.clamp_min(1e-38)), b.new_full((), float("-inf")))
+            log_K = -cost / self.sinkhorn_epsilon
+            log_a = a.masked_fill(~sm, 1.0).log()
+            log_b = b.masked_fill(~tm, 1.0).log()
+            log_u, log_v = torch.zeros_like(a), torch.zeros_like(b)
 
-        log_K = -cost / self.sinkhorn_epsilon
-        log_K = log_K.masked_fill(~src_mask.unsqueeze(-1), float("-inf"))
-        log_K = log_K.masked_fill(~tgt_mask.unsqueeze(1), float("-inf"))
+            for _ in range(self.sinkhorn_iterations):
+                # Chỉ mask chiều lấy tổng: không có hàng toàn -inf.
+                scores = (log_K + log_v.unsqueeze(1)).masked_fill(
+                    ~tm.unsqueeze(1), float("-inf")
+                )
+                log_u = (log_a - torch.logsumexp(scores, dim=-1)).masked_fill(
+                    ~sm, 0.0
+                )
 
-        # --- log-domain Sinkhorn iterations ---
-        log_u = torch.zeros(B, Ls, device=device, dtype=torch.float32)
-        log_v = torch.zeros(B, Lt, device=device, dtype=torch.float32)
-        for _ in range(self.sinkhorn_iterations):
-            log_u = log_a - torch.logsumexp(log_K + log_v.unsqueeze(1), dim=-1)
-            log_u = torch.nan_to_num(
-                log_u, nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
-            )
-            # Sanitize log_u before using it in the log_v update; otherwise NaNs
-            # from padded rows poison every target column in the same sample.
-            log_v = log_b - torch.logsumexp(
-                log_K.transpose(-1, -2) + log_u.unsqueeze(1), dim=-1
-            )
-            log_v = torch.nan_to_num(
-                log_v, nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
-            )
+                scores = (log_K + log_u.unsqueeze(-1)).masked_fill(
+                    ~sm.unsqueeze(-1), float("-inf")
+                )
+                log_v = (log_b - torch.logsumexp(scores, dim=1)).masked_fill(
+                    ~tm, 0.0
+                )
 
-        log_P = log_u.unsqueeze(-1) + log_K + log_v.unsqueeze(1)
-        transport = torch.exp(log_P)
-        transport = torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
-        # Fully-empty samples: force the plan to exactly zero rather than trust
-        # whatever fell out of the -inf/-inf arithmetic above.
-        transport = transport * valid.view(B, 1, 1).to(transport.dtype)
+            pair_mask = sm.unsqueeze(-1) & tm.unsqueeze(1)
+            log_P = log_u.unsqueeze(-1) + log_K + log_v.unsqueeze(1)
+            transport = log_P.masked_fill(~pair_mask, float("-inf")).exp()
 
-        per_sample_cost = (transport * cost).sum(dim=(1, 2))  # [B]
-        if not valid.any():
-            return src.new_zeros(())
-        return per_sample_cost[valid].mean()
+            return (transport * cost).sum(dim=(1, 2)).mean()
 
     def _ipot_ot(
         self,
