@@ -199,79 +199,68 @@ class MultilingualAlignmentModel(nn.Module):
         source_mass: torch.Tensor,
         target_mass: torch.Tensor,
     ) -> torch.Tensor:
-        """IPOT with cosine cost and arbitrary attention-derived marginals.
+        with torch.autocast(device_type=src.device.type, enabled=False):
+            a = source_mass.float().masked_fill(~src_mask.bool(), 0.0)
+            b = target_mass.float().masked_fill(~tgt_mask.bool(), 0.0)
 
-        IPOT repeatedly solves an inexact KL-proximal transport subproblem. In
-        contrast to entropic Sinkhorn, beta controls the proximal update rather
-        than permanently smoothing the final transport plan.
+            a_sum = a.sum(-1, keepdim=True)
+            b_sum = b.sum(-1, keepdim=True)
+            valid = (a_sum[:, 0] > 1e-8) & (b_sum[:, 0] > 1e-8)
 
-        Fully batched (no python loop over B) and numerically stable: all dual
-        updates are done in log-space via logsumexp, which stays stable even for
-        small beta / bf16-fp16 upstream tensors (unlike exp(-C/beta) followed by
-        clamping, which under/overflows easily).
-        """
-        B, Ls, _ = src.shape
-        Lt = tgt.shape[1]
-        device = src.device
-
-        src_mask = src_mask.bool()
-        tgt_mask = tgt_mask.bool()
-
-        # --- cosine cost, computed in fp32 regardless of upstream dtype ---
-        x = F.normalize(src.float(), dim=-1, eps=1e-8)
-        y = F.normalize(tgt.float(), dim=-1, eps=1e-8)
-        cost = 1.0 - torch.bmm(x, y.transpose(1, 2))  # [B, Ls, Lt]
-        cost = torch.nan_to_num(cost, nan=0.0, posinf=1e4, neginf=-1e4)
-
-        # --- marginals: mask out padding, guard fully-empty samples ---
-        a = source_mass.float() * src_mask
-        b = target_mass.float() * tgt_mask
-        a_sum = a.sum(dim=-1, keepdim=True)
-        b_sum = b.sum(dim=-1, keepdim=True)
-        valid = (a_sum.squeeze(-1) > 1e-8) & (b_sum.squeeze(-1) > 1e-8)  # [B]
-        a = a / a_sum.clamp_min(1e-8)
-        b = b / b_sum.clamp_min(1e-8)
-
-        # log(0) = -inf for padded/empty entries — the correct signal to exclude
-        # them from logsumexp, so don't clamp before the log.
-        log_a = torch.where(a > 0, torch.log(a.clamp_min(1e-38)), a.new_full((), float("-inf")))
-        log_b = torch.where(b > 0, torch.log(b.clamp_min(1e-38)), b.new_full((), float("-inf")))
-
-        log_proximal_kernel = -cost / self.ipot_beta
-        log_proximal_kernel = log_proximal_kernel.masked_fill(~src_mask.unsqueeze(-1), float("-inf"))
-        log_proximal_kernel = log_proximal_kernel.masked_fill(~tgt_mask.unsqueeze(1), float("-inf"))
-
-        # Feasible independent coupling to start from: log(a_i * b_j) = log_a_i + log_b_j.
-        # Padding is already -inf via log_a/log_b, no extra masking needed here.
-        log_transport = log_a.unsqueeze(-1) + log_b.unsqueeze(1)  # [B, Ls, Lt]
-
-        log_v = torch.zeros(B, Lt, device=device, dtype=torch.float32)
-        for _ in range(self.ipot_iterations):
-            log_q = log_proximal_kernel + log_transport
-            for _ in range(self.ipot_inner_iterations):
-                log_u = log_a - torch.logsumexp(log_q + log_v.unsqueeze(1), dim=-1)
-                log_u = torch.nan_to_num(
-                    log_u, nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
+            if not valid.any():
+                return (
+                    src.float().reshape(-1)[:0].sum()
+                    + tgt.float().reshape(-1)[:0].sum()
+                    + a.reshape(-1)[:0].sum()
+                    + b.reshape(-1)[:0].sum()
                 )
-                log_v = log_b - torch.logsumexp(
-                    log_q.transpose(-1, -2) + log_u.unsqueeze(1), dim=-1
-                )
-                log_v = torch.nan_to_num(
-                    log_v, nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
-                )
-            log_transport = log_u.unsqueeze(-1) + log_q + log_v.unsqueeze(1)
-            log_transport = torch.nan_to_num(log_transport, nan=float("-inf"), posinf=float("-inf"))
 
-        transport = torch.exp(log_transport)
-        transport = torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
-        # Fully-empty samples: force the plan to exactly zero rather than trust
-        # whatever fell out of the -inf/-inf arithmetic above.
-        transport = transport * valid.view(B, 1, 1).to(transport.dtype)
+            a = a[valid] / a_sum[valid]
+            b = b[valid] / b_sum[valid]
+            sm, tm = a > 0, b > 0
+            pair_mask = sm.unsqueeze(-1) & tm.unsqueeze(1)
 
-        per_sample_cost = (transport * cost).sum(dim=(1, 2))  # [B]
-        if not valid.any():
-            return src.new_zeros(())
-        return per_sample_cost[valid].mean()
+            x = src[valid].float().masked_fill(~sm.unsqueeze(-1), 0.0)
+            y = tgt[valid].float().masked_fill(~tm.unsqueeze(-1), 0.0)
+            x = F.normalize(x, dim=-1, eps=1e-6)
+            y = F.normalize(y, dim=-1, eps=1e-6)
+            cost = (1.0 - torch.bmm(x, y.transpose(1, 2))).clamp(0, 2)
+
+            log_A = -cost / self.ipot_beta
+            log_a = a.masked_fill(~sm, 1.0).log()
+            log_b = b.masked_fill(~tm, 1.0).log()
+
+            # P ban đầu = a @ b.T trên các cặp hợp lệ.
+            # Ô ngoài support giữ giá trị hữu hạn để tính logsumexp an toàn.
+            log_P = (log_a.unsqueeze(-1) + log_b.unsqueeze(1)).masked_fill(
+                ~pair_mask, 0.0
+            )
+            log_v = torch.zeros_like(b)
+
+            for _ in range(self.ipot_iterations):
+                log_Q = (log_A + log_P).masked_fill(~pair_mask, 0.0)
+
+                for _ in range(self.ipot_inner_iterations):
+                    scores = (log_Q + log_v.unsqueeze(1)).masked_fill(
+                        ~tm.unsqueeze(1), float("-inf")
+                    )
+                    log_u = (
+                        log_a - torch.logsumexp(scores, dim=-1)
+                    ).masked_fill(~sm, 0.0)
+
+                    scores = (log_Q + log_u.unsqueeze(-1)).masked_fill(
+                        ~sm.unsqueeze(-1), float("-inf")
+                    )
+                    log_v = (
+                        log_b - torch.logsumexp(scores, dim=1)
+                    ).masked_fill(~tm, 0.0)
+
+                log_P = (
+                    log_u.unsqueeze(-1) + log_Q + log_v.unsqueeze(1)
+                ).masked_fill(~pair_mask, 0.0)
+
+            transport = log_P.masked_fill(~pair_mask, float("-inf")).exp()
+            return (transport * cost).sum(dim=(1, 2)).mean()
 
     def _optimal_transport(
         self,
