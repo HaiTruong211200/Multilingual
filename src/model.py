@@ -371,14 +371,20 @@ class MultilingualAlignmentModel(nn.Module):
         # ------------------------------------------------------------------
         joint_source_mask = joint_target_mask = None
         if need_joint:
-            final_hidden = output.hidden_states[-1]
+            # Use the configured alignment layer for both representation
+            # objectives. hidden_states[-1] is only correct when align_layer=-1.
+            joint_alignment_hidden = output.hidden_states[self.align_layer]
             positions = torch.arange(
-                final_hidden.size(1), device=final_hidden.device
+                joint_alignment_hidden.size(1), device=joint_alignment_hidden.device
             ).unsqueeze(0)
-            source_start_positions = source_start_positions.to(final_hidden.device)
-            source_end_positions = source_end_positions.to(final_hidden.device)
-            target_start_positions = target_start_positions.to(final_hidden.device)
-            target_end_positions = target_end_positions.to(final_hidden.device)
+            source_start_positions = source_start_positions.to(
+                joint_alignment_hidden.device
+            )
+            source_end_positions = source_end_positions.to(joint_alignment_hidden.device)
+            target_start_positions = target_start_positions.to(
+                joint_alignment_hidden.device
+            )
+            target_end_positions = target_end_positions.to(joint_alignment_hidden.device)
             joint_source_mask = (positions >= source_start_positions[:, None]) & (
                 positions < source_end_positions[:, None]
             )
@@ -422,13 +428,13 @@ class MultilingualAlignmentModel(nn.Module):
                 output_attentions=compute_ot and self.ot_forward_mode == "independent",
                 return_dict=True,
             )
-            source_final = source_output.hidden_states[-1]
-            target_final = target_output.hidden_states[-1]
+            source_alignment_hidden = source_output.hidden_states[self.align_layer]
+            target_alignment_hidden = target_output.hidden_states[self.align_layer]
             source_mask = alignment_source_content_mask.to(
-                device=source_final.device, dtype=torch.bool
+                device=source_alignment_hidden.device, dtype=torch.bool
             )
             target_mask = alignment_target_content_mask.to(
-                device=target_final.device, dtype=torch.bool
+                device=target_alignment_hidden.device, dtype=torch.bool
             )
 
         # ------------------------------------------------------------------
@@ -492,12 +498,12 @@ class MultilingualAlignmentModel(nn.Module):
                     attention_target_mask,
                 )
                 ot = self._optimal_transport(
-                    final_hidden,
-                    final_hidden,
+                    joint_alignment_hidden,
+                    joint_alignment_hidden,
                     joint_source_mask,
                     joint_target_mask,
-                    source_mass.to(final_hidden.device),
-                    target_mass.to(final_hidden.device),
+                    source_mass.to(joint_alignment_hidden.device),
+                    target_mass.to(joint_alignment_hidden.device),
                 )
             elif self.ot_forward_mode == "independent":
                 # No cross-sentence attention exists here. Each marginal is
@@ -523,12 +529,12 @@ class MultilingualAlignmentModel(nn.Module):
                     target_attention_mask,
                 )
                 ot = self._optimal_transport(
-                    source_final,
-                    target_final.to(source_final.device),
+                    source_alignment_hidden,
+                    target_alignment_hidden.to(source_alignment_hidden.device),
                     source_mask,
-                    target_mask.to(source_final.device),
-                    source_mass.to(source_final.device),
-                    target_mass.to(source_final.device),
+                    target_mask.to(source_alignment_hidden.device),
+                    source_mass.to(source_alignment_hidden.device),
+                    target_mass.to(source_alignment_hidden.device),
                 )
             else:
                 # Reverse prompt is (instruction target->source, target, source).
@@ -552,16 +558,21 @@ class MultilingualAlignmentModel(nn.Module):
                     output_attentions=True,
                     return_dict=True,
                 )
-                reverse_final = reverse_output.hidden_states[-1]
+                reverse_alignment_hidden = reverse_output.hidden_states[self.align_layer]
                 reverse_positions = torch.arange(
-                    reverse_final.size(1), device=reverse_final.device
+                    reverse_alignment_hidden.size(1),
+                    device=reverse_alignment_hidden.device,
                 ).unsqueeze(0)
                 reverse_target_mask = (
                     reverse_positions
-                    >= reverse_target_start_positions.to(reverse_final.device)[:, None]
+                    >= reverse_target_start_positions.to(
+                        reverse_alignment_hidden.device
+                    )[:, None]
                 ) & (
                     reverse_positions
-                    < reverse_target_end_positions.to(reverse_final.device)[:, None]
+                    < reverse_target_end_positions.to(
+                        reverse_alignment_hidden.device
+                    )[:, None]
                 )
                 # Attention mass for each side comes from target queries in its
                 # own directional prompt; instruction/source/EOS remain masked
@@ -587,12 +598,12 @@ class MultilingualAlignmentModel(nn.Module):
                     reverse_attention_mask,
                 )
                 ot = self._optimal_transport(
-                    final_hidden,
-                    reverse_final.to(final_hidden.device),
+                    joint_alignment_hidden,
+                    reverse_alignment_hidden.to(joint_alignment_hidden.device),
                     joint_target_mask,
-                    reverse_target_mask.to(final_hidden.device),
-                    forward_mass.to(final_hidden.device),
-                    reverse_mass.to(final_hidden.device),
+                    reverse_target_mask.to(joint_alignment_hidden.device),
+                    forward_mass.to(joint_alignment_hidden.device),
+                    reverse_mass.to(joint_alignment_hidden.device),
                 )
         # Usually all three losses are already colocated. Explicit movement is
         # required for model/tensor parallel layouts where alignment hidden
