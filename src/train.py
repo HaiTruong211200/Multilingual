@@ -30,6 +30,8 @@ class ComponentLoggingTrainer(Trainer):
     COMPONENT_KEYS = (
         "model_total_loss", "ntp_loss", "contrastive_loss", "ot_loss",
         "weighted_contrastive_loss", "weighted_ot_loss",
+        "structure_loss", "source_structure_loss", "target_structure_loss",
+        "weighted_structure_loss",
     )
 
     def __init__(
@@ -224,6 +226,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--contrastive_weight", type=float, default=0.0)
     parser.add_argument("--ot_weight", type=float, default=0.0)
+    parser.add_argument("--structure_weight", type=float, default=0.0)
+    parser.add_argument("--structure_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--structure_reference_model_name_or_path",
+        default=None,
+        help=(
+            "Frozen CE+contrastive teacher checkpoint used by cosine-structure "
+            "KL. Required when --structure_weight is non-zero."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--align_layer", type=int, default=-1)
     parser.add_argument(
@@ -356,6 +368,11 @@ def build_stage(args, tokenizer):
             args.model_name_or_path,
             contrastive_weight=args.contrastive_weight,
             ot_weight=args.ot_weight,
+            structure_weight=args.structure_weight,
+            structure_temperature=args.structure_temperature,
+            structure_reference_model_name_or_path=(
+                args.structure_reference_model_name_or_path
+            ),
             temperature=args.temperature,
             align_layer=args.align_layer,
             contrastive_forward_mode=args.contrastive_forward_mode,
@@ -443,9 +460,10 @@ def main() -> None:
     )
     if args.stage == "alignment":
         LOGGER.info(
-            "Data MT=%s | pairs=%s | direction=%s | mode=%s | loss=NTP + %.4g*CL + %.4g*OT",
+            "Data MT=%s | pairs=%s | direction=%s | mode=%s | loss=NTP + %.4g*CL + %.4g*OT + %.4g*structure",
             args.data_dir, args.language_pairs, args.direction,
             args.training_mode, args.contrastive_weight, args.ot_weight,
+            args.structure_weight,
         )
         LOGGER.info(
             "Contrastive forward=%s | OT forward=%s | layer=%d | contrastive_temperature=%g | attention_mass_weight=%g | OT solver=%s",
@@ -453,6 +471,12 @@ def main() -> None:
             args.temperature, args.attention_mass_weight,
             args.ot_solver,
         )
+        if args.structure_weight != 0.0:
+            LOGGER.info(
+                "Cosine structure teacher=%s | temperature=%g | KL=reference||current",
+                args.structure_reference_model_name_or_path,
+                args.structure_temperature,
+            )
         if args.ot_solver == "sinkhorn":
             LOGGER.info(
                 "Sinkhorn epsilon=%g | schedule=%s | end=%g | iterations=%d",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from peft import PeftConfig, PeftModel
 
 
 @dataclass
@@ -22,6 +24,10 @@ class AlignmentCausalLMOutputWithPast(CausalLMOutputWithPast):
     ot_loss: Optional[torch.FloatTensor] = None
     weighted_contrastive_loss: Optional[torch.FloatTensor] = None
     weighted_ot_loss: Optional[torch.FloatTensor] = None
+    structure_loss: Optional[torch.FloatTensor] = None
+    source_structure_loss: Optional[torch.FloatTensor] = None
+    target_structure_loss: Optional[torch.FloatTensor] = None
+    weighted_structure_loss: Optional[torch.FloatTensor] = None
 
 
 def masked_mean(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -37,6 +43,9 @@ class MultilingualAlignmentModel(nn.Module):
         model_name_or_path: str,
         contrastive_weight: float = 0.0,
         ot_weight: float = 0.0,
+        structure_weight: float = 0.0,
+        structure_temperature: float = 0.1,
+        structure_reference_model_name_or_path: Optional[str] = None,
         temperature: float = 0.07,
         align_layer: int = -1,
         contrastive_forward_mode: str = "joint",
@@ -60,6 +69,10 @@ class MultilingualAlignmentModel(nn.Module):
         self.config = self.lm.config
         self.contrastive_weight = contrastive_weight
         self.ot_weight = ot_weight
+        self.structure_weight = structure_weight
+        if structure_temperature <= 0.0:
+            raise ValueError("structure_temperature must be positive")
+        self.structure_temperature = structure_temperature
         self.temperature = temperature
         self.align_layer = align_layer
         if contrastive_forward_mode not in {"joint", "independent"}:
@@ -88,9 +101,103 @@ class MultilingualAlignmentModel(nn.Module):
         self.ipot_beta = ipot_beta
         self.ipot_iterations = ipot_iterations
         self.ipot_inner_iterations = ipot_inner_iterations
+        self.reference_lm = None
+        if structure_weight != 0.0:
+            if not structure_reference_model_name_or_path:
+                raise ValueError(
+                    "structure_reference_model_name_or_path is required when "
+                    "structure_weight is non-zero"
+                )
+            reference_path = Path(structure_reference_model_name_or_path)
+            adapter_config_path = reference_path / "adapter_config.json"
+            if adapter_config_path.exists():
+                peft_config = PeftConfig.from_pretrained(
+                    structure_reference_model_name_or_path
+                )
+                reference_base = AutoModelForCausalLM.from_pretrained(
+                    peft_config.base_model_name_or_path,
+                    trust_remote_code=trust_remote_code,
+                    attn_implementation=attn_implementation,
+                )
+                self.reference_lm = PeftModel.from_pretrained(
+                    reference_base,
+                    structure_reference_model_name_or_path,
+                    is_trainable=False,
+                )
+            else:
+                self.reference_lm = AutoModelForCausalLM.from_pretrained(
+                    structure_reference_model_name_or_path,
+                    trust_remote_code=trust_remote_code,
+                    attn_implementation=attn_implementation,
+                )
+            self.reference_lm.requires_grad_(False)
+            self.reference_lm.eval()
 
     def gradient_checkpointing_enable(self, **kwargs):
         return self.lm.gradient_checkpointing_enable(**kwargs)
+
+    def train(self, mode: bool = True):
+        """Train the student while keeping the structure teacher deterministic."""
+        super().train(mode)
+        if self.reference_lm is not None:
+            self.reference_lm.eval()
+        return self
+
+    def _cosine_structure_kl(
+        self,
+        current_hidden: torch.Tensor,
+        reference_hidden: torch.Tensor,
+        content_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """KL(Q_reference || Q_current) over intra-sequence cosine structure.
+
+        Each valid token defines one row distribution over the other valid
+        content tokens. Padding, prompt tokens and the self-similarity diagonal
+        are excluded. Samples with fewer than two valid tokens contribute zero.
+        """
+        current = F.normalize(current_hidden.float(), dim=-1, eps=1e-8)
+        reference = F.normalize(reference_hidden.float(), dim=-1, eps=1e-8)
+        current_similarity = torch.bmm(current, current.transpose(1, 2))
+        reference_similarity = torch.bmm(reference, reference.transpose(1, 2))
+
+        mask = content_mask.to(device=current.device, dtype=torch.bool)
+        length = mask.size(1)
+        diagonal = torch.eye(length, device=mask.device, dtype=torch.bool).unsqueeze(0)
+        valid_pairs = mask.unsqueeze(2) & mask.unsqueeze(1) & ~diagonal
+        valid_rows = valid_pairs.any(dim=-1)
+
+        current_logits = current_similarity / self.structure_temperature
+        reference_logits = (
+            reference_similarity.to(current.device) / self.structure_temperature
+        )
+        current_logits = current_logits.masked_fill(~valid_pairs, float("-inf"))
+        reference_logits = reference_logits.masked_fill(~valid_pairs, float("-inf"))
+
+        # Avoid all--inf softmax rows for padding/single-token samples. These
+        # rows are removed by valid_rows immediately after KL is computed.
+        current_logits = torch.where(
+            valid_rows.unsqueeze(-1), current_logits, torch.zeros_like(current_logits)
+        )
+        reference_logits = torch.where(
+            valid_rows.unsqueeze(-1),
+            reference_logits,
+            torch.zeros_like(reference_logits),
+        )
+        current_log_probability = F.log_softmax(current_logits, dim=-1)
+        reference_log_probability = F.log_softmax(reference_logits, dim=-1)
+        reference_probability = reference_log_probability.exp()
+        kl_elements = torch.where(
+            valid_pairs,
+            reference_probability
+            * (reference_log_probability - current_log_probability),
+            torch.zeros_like(reference_probability),
+        )
+        row_kl = kl_elements.sum(dim=-1)
+        if not valid_rows.any():
+            return current_similarity.new_zeros(())
+        # Keep KL in fp32 even when hidden states are bf16/fp16; small
+        # neighborhood differences would otherwise underflow unnecessarily.
+        return row_kl[valid_rows].mean()
 
     def _contrastive(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         """Within-instruction contrastive loss following the reference Llama model.
@@ -305,11 +412,12 @@ class MultilingualAlignmentModel(nn.Module):
         # ------------------------------------------------------------------
         compute_contrastive = self.contrastive_weight != 0.0
         compute_ot = self.ot_weight != 0.0
+        compute_structure = self.structure_weight != 0.0
         need_joint = (
             compute_contrastive and self.contrastive_forward_mode == "joint"
         ) or (
             compute_ot and self.ot_forward_mode in {"joint", "bidirectional"}
-        )
+        ) or compute_structure
         need_independent = (
             compute_contrastive and self.contrastive_forward_mode == "independent"
         ) or (
@@ -335,6 +443,9 @@ class MultilingualAlignmentModel(nn.Module):
         ntp_loss = output.loss
         contrastive = ntp_loss.new_zeros(())
         ot = ntp_loss.new_zeros(())
+        source_structure = ntp_loss.new_zeros(())
+        target_structure = ntp_loss.new_zeros(())
+        structure = ntp_loss.new_zeros(())
 
         attention_layer = (
             self.align_layer if self.align_layer < 0 else max(self.align_layer - 1, 0)
@@ -368,11 +479,46 @@ class MultilingualAlignmentModel(nn.Module):
                 positions < target_end_positions[:, None]
             )
 
+        # ------------------------------------------------------------------
+        # Block 4: Preserve intra-sequence cosine neighborhoods from a frozen
+        # CE+contrastive teacher. Both KL terms use the same full prompt and
+        # alignment layer as the student; only source/target content spans are
+        # visible and the similarity diagonal is removed inside the KL helper.
+        # ------------------------------------------------------------------
+        if compute_structure:
+            self.reference_lm.eval()
+            reference_device = next(self.reference_lm.parameters()).device
+            with torch.no_grad():
+                reference_output = self.reference_lm(
+                    input_ids=input_ids.to(reference_device),
+                    attention_mask=attention_mask.to(reference_device),
+                    output_hidden_states=True,
+                    output_attentions=False,
+                    return_dict=True,
+                )
+            reference_hidden = reference_output.hidden_states[self.align_layer]
+            current_hidden = output.hidden_states[self.align_layer]
+            reference_hidden = reference_hidden.to(current_hidden.device)
+            source_structure = self._cosine_structure_kl(
+                current_hidden,
+                reference_hidden,
+                joint_source_mask.to(current_hidden.device),
+            )
+            target_structure = self._cosine_structure_kl(
+                current_hidden,
+                reference_hidden,
+                joint_target_mask.to(current_hidden.device),
+            )
+            structure = 0.5 * (source_structure + target_structure)
+            # Release teacher logits/hidden-state tuple before optional
+            # independent or reverse student forwards allocate more memory.
+            del reference_output, reference_hidden
+
         source_output = target_output = None
         source_mask = target_mask = None
         if need_independent:
             # --------------------------------------------------------------
-            # Block 4: Obtain context-independent H_x and H_y.
+            # Block 5: Obtain context-independent H_x and H_y.
             # prepare_data tokenized both complete sentences beforehand and
             # the collator padded them independently. content_mask removes
             # BOS/EOS/PAD from pooling and token-level OT.
@@ -414,7 +560,7 @@ class MultilingualAlignmentModel(nn.Module):
             )
 
         # ------------------------------------------------------------------
-        # Block 5: Contrastive objective has exactly two supported views.
+        # Block 6: Contrastive objective has exactly two supported views.
         # - joint:       mean-pool source/target spans from the main prompt.
         # - independent: mean-pool two separately encoded sentences.
         # It deliberately has no bidirectional conditional mode.
@@ -447,7 +593,7 @@ class MultilingualAlignmentModel(nn.Module):
                 )
 
         # ------------------------------------------------------------------
-        # Block 6: Token-level OT routing.
+        # Block 7: Token-level OT routing.
         # - joint:         OT(H_x from the prompt, H_y|x).
         # - independent:   OT(H_x from source-only, H_y from target-only).
         # - bidirectional: OT(H_y|x, H_x|y), requiring one reverse prompt.
@@ -586,9 +732,15 @@ class MultilingualAlignmentModel(nn.Module):
         # states and the LM head may live on different devices.
         contrastive = contrastive.to(ntp_loss.device)
         ot = ot.to(ntp_loss.device)
+        source_structure = source_structure.to(ntp_loss.device)
+        target_structure = target_structure.to(ntp_loss.device)
+        structure = structure.to(ntp_loss.device)
         weighted_contrastive = self.contrastive_weight * contrastive
         weighted_ot = self.ot_weight * ot
-        total_loss = ntp_loss + weighted_contrastive + weighted_ot
+        weighted_structure = self.structure_weight * structure
+        total_loss = (
+            ntp_loss + weighted_contrastive + weighted_ot + weighted_structure
+        )
         return AlignmentCausalLMOutputWithPast(
             loss=total_loss,
             logits=output.logits,
@@ -601,4 +753,8 @@ class MultilingualAlignmentModel(nn.Module):
             ot_loss=ot.detach(),
             weighted_contrastive_loss=weighted_contrastive.detach(),
             weighted_ot_loss=weighted_ot.detach(),
+            structure_loss=structure.detach(),
+            source_structure_loss=source_structure.detach(),
+            target_structure_loss=target_structure.detach(),
+            weighted_structure_loss=weighted_structure.detach(),
         )

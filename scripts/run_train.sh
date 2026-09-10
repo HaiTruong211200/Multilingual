@@ -27,6 +27,8 @@ ARGS=(
   --contrastive_weight "${CONTRASTIVE_WEIGHT:-0.0}"
   --temperature "${CONTRASTIVE_TEMPERATURE:-0.07}"
   --ot_weight "${OT_WEIGHT:-0.0}"
+  --structure_weight "${STRUCTURE_WEIGHT:-0.0}"
+  --structure_temperature "${STRUCTURE_TEMPERATURE:-0.1}"
   --attention_mass_weight "${ATTENTION_MASS_WEIGHT:-0.5}"
   --ot_solver "${OT_SOLVER:-sinkhorn}"
   --learning_rate "${LEARNING_RATE:-2e-5}"
@@ -58,6 +60,17 @@ ARGS=(
   --warmup_steps "${WARMUP_STEPS:-0}"
   --report_to "${REPORT_TO:-tensorboard}"
 )
+
+if [[ "${STRUCTURE_WEIGHT:-0.0}" != "0" && "${STRUCTURE_WEIGHT:-0.0}" != "0.0" ]]; then
+  if [[ -z "${STRUCTURE_REFERENCE_MODEL_NAME_OR_PATH:-}" ]]; then
+    echo "STRUCTURE_REFERENCE_MODEL_NAME_OR_PATH is required when STRUCTURE_WEIGHT is non-zero" >&2
+    exit 2
+  fi
+  ARGS+=(
+    --structure_reference_model_name_or_path
+    "$STRUCTURE_REFERENCE_MODEL_NAME_OR_PATH"
+  )
+fi
 
 if [[ "${ENABLE_THINKING:-false}" == "true" ]]; then
   ARGS+=(--enable_thinking)
