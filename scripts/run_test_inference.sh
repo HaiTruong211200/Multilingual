@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 ARGS=(
-  -m src.test_inference
+  -m eval.inference
   --model_name_or_path "${MODEL_NAME_OR_PATH:-outputs/stage2-instruction-ft}"
   --data_dir "${DATA_DIR:-data/MT}"
   --language_pairs "${LANGUAGE_PAIRS:-all}"
