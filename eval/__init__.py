@@ -4,8 +4,13 @@ from typing import Any
 
 __all__ = [
     "evaluate_folder_sentence_bleu",
+    "build_embeddings_dict",
+    "extract_all_layer_embeddings",
     "extract_model_embeddings",
-    "load_multilingual_texts",
+    "load_mt_pair_texts",
+    "load_parallel_mt50_json",
+    "plot_multilingual_tsne_scatter",
+    "resolve_model_checkpoint",
     "run_translation_inference",
     "visualize_ot_alignment",
     "visualize_model_tsne",
@@ -34,14 +39,44 @@ def visualize_ot_alignment(*args: Any, **kwargs: Any):
     return implementation(*args, **kwargs)
 
 
-def load_multilingual_texts(*args: Any, **kwargs: Any):
-    from .visualize_tsne import load_multilingual_texts as implementation
+def load_mt_pair_texts(*args: Any, **kwargs: Any):
+    from .visualize_tsne import load_mt_pair_texts as implementation
 
     return implementation(*args, **kwargs)
 
 
 def extract_model_embeddings(*args: Any, **kwargs: Any):
     from .visualize_tsne import extract_model_embeddings as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def load_parallel_mt50_json(*args: Any, **kwargs: Any):
+    from .visualize_tsne import load_parallel_mt50_json as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def extract_all_layer_embeddings(*args: Any, **kwargs: Any):
+    from .visualize_tsne import extract_all_layer_embeddings as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def build_embeddings_dict(*args: Any, **kwargs: Any):
+    from .visualize_tsne import build_embeddings_dict as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def plot_multilingual_tsne_scatter(*args: Any, **kwargs: Any):
+    from .visualize_tsne import plot_multilingual_tsne_scatter as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def resolve_model_checkpoint(*args: Any, **kwargs: Any):
+    from .visualize_tsne import resolve_model_checkpoint as implementation
 
     return implementation(*args, **kwargs)
 

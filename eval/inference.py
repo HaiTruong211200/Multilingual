@@ -1,8 +1,8 @@
-"""Run translation inference on MT test splits and export src/ref/pred CSV."""
+"""Run translation inference and export one JSONL file per translation direction."""
 from __future__ import annotations
 
 import argparse
-import csv
+import json
 import sys
 import time
 from collections import defaultdict
@@ -264,6 +264,11 @@ def _run_translation_inference(args: argparse.Namespace) -> dict:
                     "src": row["source"],
                     "ref": row["target"],
                     "pred": prediction.strip(),
+                    "source": row["source"],
+                    "gold": row["target"],
+                    "prediction": prediction.strip(),
+                    "src_lang": row["source_lang"],
+                    "tgt_lang": row["target_lang"],
                 })
                 counts[direction] += 1
             progress.update(len(row_batch))
@@ -276,29 +281,28 @@ def _run_translation_inference(args: argparse.Namespace) -> dict:
         torch.cuda.synchronize(device)
     timings["generation"] = time.perf_counter() - phase_started
 
-    print("Inference complete. Writing CSV files...", flush=True)
+    print("Inference complete. Writing JSONL files...", flush=True)
     phase_started = time.perf_counter()
     for direction, result_rows in tqdm(
         sorted(predictions_by_direction.items()),
-        desc="Writing CSV files",
+        desc="Writing JSONL files",
         unit="file",
         dynamic_ncols=True,
         file=sys.stdout,
     ):
-        path = output_dir / f"{direction}.csv"
-        with path.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["src", "ref", "pred"])
-            writer.writeheader()
-            writer.writerows(result_rows)
+        path = output_dir / f"translation.{direction}.jsonl"
+        with path.open("w", encoding="utf-8") as handle:
+            for row in result_rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"Saved {len(result_rows)} rows to {path.resolve()}")
-    timings["csv_write"] = time.perf_counter() - phase_started
+    timings["jsonl_write"] = time.perf_counter() - phase_started
     timings["total"] = time.perf_counter() - total_started
 
     print("\nTiming summary")
     measured_total = timings["total"]
     for name in (
         "tokenizer_load", "model_load", "data_load", "tokenization",
-        "collation", "generation", "csv_write", "total",
+        "collation", "generation", "jsonl_write", "total",
     ):
         seconds = timings[name]
         percentage = 100.0 * seconds / measured_total
@@ -310,7 +314,9 @@ def _run_translation_inference(args: argparse.Namespace) -> dict:
         print(
             f"  generation_speed {total_rows / timings['generation']:.2f} sample/s"
         )
-        print(f"  csv_write_speed  {total_rows / timings['csv_write']:.2f} sample/s")
+        print(
+            f"  jsonl_write_speed {total_rows / timings['jsonl_write']:.2f} sample/s"
+        )
         print(f"  avg_new_tokens   {generated_token_count / total_rows:.2f} token/sample")
         print(f"  reached_eos      {reached_eos_count}/{total_rows}")
 
