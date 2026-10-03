@@ -15,6 +15,7 @@ from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dic
 
 from .collator import InstructionDataCollator, MultilingualDataCollator
 from .model import MultilingualAlignmentModel
+from .sampler import LanguagePairSampler
 from .prepare_data import (
     load_instruction_dataset,
     load_parallel_dataset,
@@ -38,12 +39,16 @@ class ComponentLoggingTrainer(Trainer):
         self,
         *args,
         stage: str,
+        batch_by_language_pair: bool = False,
         sinkhorn_epsilon_schedule: str = "constant",
         sinkhorn_epsilon_end: float = 0.01,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.stage = stage
+        self.batch_by_language_pair = batch_by_language_pair
+        if batch_by_language_pair and stage != "alignment":
+            raise ValueError("batch_by_language_pair is supported only for alignment training")
         self.sinkhorn_epsilon_schedule = sinkhorn_epsilon_schedule
         self.sinkhorn_epsilon_end = sinkhorn_epsilon_end
         # The alignment wrapper accepts **kwargs for compatibility but does not
@@ -54,6 +59,28 @@ class ComponentLoggingTrainer(Trainer):
             self.model_accepts_loss_kwargs = False
         self._sums = {"train": defaultdict(float), "eval": defaultdict(float)}
         self._counts = {"train": 0, "eval": 0}
+
+    def _get_train_sampler(self, train_dataset=None):
+        if not self.batch_by_language_pair:
+            if train_dataset is None:
+                return super()._get_train_sampler()
+            return super()._get_train_sampler(train_dataset)
+        if self.accelerator.split_batches:
+            raise ValueError("Pair batching requires Accelerate split_batches=False")
+        sampler = LanguagePairSampler(
+            self.train_dataset if train_dataset is None else train_dataset,
+            batch_size=self._train_batch_size,
+            world_size=self.accelerator.num_processes,
+            seed=self.args.data_seed if self.args.data_seed is not None else self.args.seed,
+        )
+        if len(sampler) == 0:
+            raise ValueError("No language pair has enough samples for one full global batch")
+        LOGGER.info(
+            "Pair batching enabled | pairs=%d | usable_samples=%d | dropped_samples=%d",
+            len(sampler.groups), len(sampler),
+            sum(len(indices) for indices in sampler.groups.values()) - len(sampler),
+        )
+        return sampler
 
     def _update_sinkhorn_epsilon(self, model) -> None:
         """Apply the configured epsilon schedule before a training forward pass."""
@@ -211,6 +238,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_file")
     parser.add_argument("--validation_file")
     parser.add_argument("--language_pairs", default="all")
+    parser.add_argument(
+        "--batch_by_language_pair", action=argparse.BooleanOptionalAction,
+        default=False, help="Use one directed language pair per training batch (alignment only).",
+    )
     parser.add_argument("--direction", choices=["forward", "reverse", "both"], default="forward")
     parser.add_argument("--xlsum_dir", default="data/XLSum/XLSum")
     parser.add_argument("--bactrian_dir", default="data/Bactrian-Multilingual_Instruction")
@@ -567,6 +598,7 @@ def main() -> None:
         train_dataset=dataset["train"], eval_dataset=dataset["validation"],
         data_collator=collator,
         stage=args.stage,
+        batch_by_language_pair=args.batch_by_language_pair,
         sinkhorn_epsilon_schedule=args.sinkhorn_epsilon_schedule,
         sinkhorn_epsilon_end=args.sinkhorn_epsilon_end,
         processing_class=tokenizer,

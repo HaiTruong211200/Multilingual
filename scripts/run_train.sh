@@ -78,6 +78,10 @@ else
   ARGS+=(--no-enable_thinking)
 fi
 
+if [[ "${BATCH_BY_LANGUAGE_PAIR:-false}" == "true" ]]; then
+  ARGS+=(--batch_by_language_pair)
+fi
+
 if [[ "$PRECISION" == "bf16" ]]; then
   ARGS+=(--bf16)
 elif [[ "$PRECISION" == "fp16" ]]; then

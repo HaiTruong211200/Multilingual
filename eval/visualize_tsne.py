@@ -365,6 +365,7 @@ def plot_multilingual_tsne_scatter(
         ).numpy()
         projected = TSNE(
             n_components=2,
+            metric="cosine",
             perplexity=effective_perplexity,
             init="pca",
             learning_rate="auto",

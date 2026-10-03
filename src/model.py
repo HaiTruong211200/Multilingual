@@ -539,6 +539,7 @@ class MultilingualAlignmentModel(nn.Module):
             source_output = self.lm(
                 input_ids=alignment_source_input_ids,
                 attention_mask=alignment_source_attention_mask,
+                use_cache=False,
                 output_hidden_states=True,
                 output_attentions=compute_ot and self.ot_forward_mode == "independent",
                 return_dict=True,
@@ -546,6 +547,7 @@ class MultilingualAlignmentModel(nn.Module):
             target_output = self.lm(
                 input_ids=alignment_target_input_ids,
                 attention_mask=alignment_target_attention_mask,
+                use_cache=False,
                 output_hidden_states=True,
                 output_attentions=compute_ot and self.ot_forward_mode == "independent",
                 return_dict=True,
