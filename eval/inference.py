@@ -7,6 +7,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Iterable
 
 import torch
 from torch.utils.data import DataLoader
@@ -17,7 +18,7 @@ from tqdm.auto import tqdm
 from src.collator import TranslationInferenceCollator
 from src.prepare_data import (
     _discover_mt,
-    _parallel_rows,
+    _iter_json,
     prepare_translation_inference_dataset,
 )
 
@@ -61,6 +62,48 @@ def limit_per_direction(iterator, limit: int | None):
         if seen[direction] < limit:
             seen[direction] += 1
             yield row
+
+
+def iter_inference_rows(paths: Iterable[Path], direction: str):
+    """Preserve each original dataset record while adding generation helpers."""
+    for path in paths:
+        for line_number, original in enumerate(_iter_json(path), start=1):
+            src_lang = original.get("src_lang")
+            tgt_lang = original.get("tgt_lang")
+            translation = original.get("translation")
+            if (
+                not src_lang
+                or not tgt_lang
+                or not isinstance(translation, dict)
+            ):
+                raise ValueError(f"Invalid translation schema at {path}:{line_number}")
+            source = str(translation.get(src_lang, "")).strip()
+            target = str(translation.get(tgt_lang, "")).strip()
+            if not source or not target:
+                continue
+
+            if direction in {"forward", "both"}:
+                row = dict(original)
+                row.update({
+                    "src_lang": src_lang,
+                    "tgt_lang": tgt_lang,
+                    "source_lang": src_lang,
+                    "target_lang": tgt_lang,
+                    "source": source,
+                    "target": target,
+                })
+                yield row
+            if direction in {"reverse", "both"}:
+                row = dict(original)
+                row.update({
+                    "src_lang": tgt_lang,
+                    "tgt_lang": src_lang,
+                    "source_lang": tgt_lang,
+                    "target_lang": src_lang,
+                    "source": target,
+                    "target": source,
+                })
+                yield row
 
 
 def format_duration(seconds: float) -> str:
@@ -179,7 +222,7 @@ def _run_translation_inference(args: argparse.Namespace) -> dict:
     print("Loading test samples...", flush=True)
     phase_started = time.perf_counter()
     rows = list(limit_per_direction(
-        _parallel_rows(paths, args.direction), args.max_samples
+        iter_inference_rows(paths, args.direction), args.max_samples
     ))
     timings["data_load"] = time.perf_counter() - phase_started
     total_rows = len(rows)
@@ -260,16 +303,24 @@ def _run_translation_inference(args: argparse.Namespace) -> dict:
                     generated_token_count += token_row.numel()
             for row, prediction in zip(row_batch, predictions):
                 direction = f"{row['source_lang']}-{row['target_lang']}"
-                predictions_by_direction[direction].append({
-                    "src": row["source"],
-                    "ref": row["target"],
-                    "pred": prediction.strip(),
-                    "source": row["source"],
-                    "gold": row["target"],
-                    "prediction": prediction.strip(),
+                prediction_raw = prediction.strip()
+                gold = str(row["target"]).strip()
+                result_row = {
+                    key: value
+                    for key, value in row.items()
+                    if key not in {
+                        "source", "target", "source_lang", "target_lang"
+                    }
+                }
+                result_row.update({
                     "src_lang": row["source_lang"],
                     "tgt_lang": row["target_lang"],
+                    "prediction_raw": prediction_raw,
+                    "prediction": prediction_raw,
+                    "gold": gold,
+                    "is_correct": prediction_raw == gold,
                 })
+                predictions_by_direction[direction].append(result_row)
                 counts[direction] += 1
             progress.update(len(row_batch))
             progress.set_postfix_str(

@@ -105,13 +105,16 @@ def evaluate_folder_sentence_bleu(
                     if not prediction or not reference:
                         skipped += 1
                         continue
+                    # Match the requested Chinese metric; retain the existing
+                    # effective-order setting for other target languages.
+                    bleu_kwargs = {"tokenize": "zh", "smooth_method": "exp"}
+                    if tgt_lang != "zh":
+                        bleu_kwargs.update(tokenize="13a", use_effective_order=True)
                     scores.append(
                         sacrebleu.sentence_bleu(
                             prediction,
                             [reference],
-                            tokenize="13a",
-                            smooth_method="exp",
-                            use_effective_order=True,
+                            **bleu_kwargs,
                         ).score
                     )
                 except (json.JSONDecodeError, TypeError, ValueError):
