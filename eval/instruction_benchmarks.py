@@ -20,9 +20,11 @@ def parse_answer(text, task):
         answer = match.group(1).upper()
         return str('ABCD'.index(answer) + 1) if answer in 'ABCD' else answer
     text = text.replace(',', '')
-    marked = re.search(r'(?:####|Final answer\s*:)\s*([-+]?\d+(?:\.\d+)?)', text, re.I)
+    marked_answers = re.findall(
+        r'(?:####|(?:Final\s+)?Answer\s*:)\s*([-+]?\d+(?:\.\d+)?)', text, re.I,
+    )
     numbers = re.findall(r'[-+]?\d+(?:\.\d+)?', text)
-    answer = marked.group(1) if marked else (numbers[-1] if numbers else None)
+    answer = marked_answers[-1] if marked_answers else (numbers[-1] if numbers else None)
     if answer is None:
         return None
     try:
@@ -55,6 +57,19 @@ def load_benchmark_jsonl(data_dir, languages, task, max_samples=None):
                     row = json.loads(line)
                 except json.JSONDecodeError as error:
                     raise ValueError(f'{path}:{line_number}: invalid JSON') from error
+                if task == 'mgsm' and isinstance(row, dict) and {'question', 'answer'}.issubset(row):
+                    # GlobalMGSM test schema differs from its prompt/chosen train split.
+                    row = {**row, 'answer_number': row['answer']}
+                if task == 'mgsm' and isinstance(row, dict) and {'prompt', 'chosen'}.issubset(row):
+                    # GlobalMGSM carries a rendered prompt and a worked solution.
+                    # Require its explicit final-answer marker rather than
+                    # accidentally treating an intermediate number as gold.
+                    solution = str(row['chosen'] or '')
+                    answers = re.findall(r'####\s*([-+]?\d[\d,]*(?:\.\d+)?)', solution)
+                    if not answers:
+                        raise ValueError(f'{path}:{line_number}: chosen must contain a numeric #### final answer')
+                    row = {**row, 'question': str(row['prompt'] or ''),
+                           'answer_number': answers[-1], '_prompt_preformatted': True}
                 if not isinstance(row, dict) or not required.issubset(row):
                     raise ValueError(f'{path}:{line_number}: expected fields {sorted(required)}')
                 if task == 'belebele' and str(row['correct_answer_num']) not in {'1', '2', '3', '4'}:
@@ -69,6 +84,23 @@ def load_benchmark_jsonl(data_dir, languages, task, max_samples=None):
         print(f'{task} [{language}]: {len(records)} samples from {path}')
         jobs.append((task, language, records))
     return jobs
+
+
+def build_mgsm_prompt(row):
+    """Render test instructions using the same Alpaca template as Stage 2."""
+    from src.prompts import instruction_prompt
+
+    if row.get('_prompt_preformatted'):
+        return row['question']
+    instruction = str(row.get('instruction') or '').strip()
+    if instruction:
+        # Keep the dataset's reasoning and final-answer format requirements.
+        return instruction_prompt(instruction, str(row['question']))
+    prefix = str(row.get('answer_prefix') or 'Answer').strip().rstrip(':')
+    return instruction_prompt(
+        f'Solve the math problem. End with {prefix}: <number>.',
+        str(row['question']),
+    )
 
 
 def run_instruction_benchmarks(
@@ -134,7 +166,7 @@ def run_instruction_benchmarks(
         prompts = []
         for row in data:
             if task == 'mgsm':
-                prompt = row['question'] + '\nSolve the problem. End with: Final answer: <number>.'
+                prompt = build_mgsm_prompt(row)
             else:
                 options = '\n'.join(f'{letter}. {row["mc_answer" + str(i)]}' for i, letter in enumerate('ABCD', 1))
                 prompt = f'{row["flores_passage"]}\n\n{row["question"]}\n{options}\nAnswer with only A, B, C, or D.'
