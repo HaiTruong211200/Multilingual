@@ -32,7 +32,7 @@ def parse_answer(text, task):
 
 
 def load_benchmark_jsonl(data_dir, languages, task, max_samples=None):
-    """Read <data_dir>/<language>/test.jsonl and validate before model loading."""
+    """Read <data_dir>/<language>/test.<language>.jsonl before model loading."""
     if isinstance(languages, str):
         languages = [value.strip() for value in languages.split(',') if value.strip()]
     if not languages:
@@ -45,7 +45,7 @@ def load_benchmark_jsonl(data_dir, languages, task, max_samples=None):
     }
     jobs = []
     for language in languages:
-        path = Path(data_dir) / language / 'test.jsonl'
+        path = Path(data_dir) / language / f'test.{language}.jsonl'
         records = []
         with path.open(encoding='utf-8') as handle:
             for line_number, line in enumerate(handle, 1):
@@ -86,7 +86,7 @@ def run_instruction_benchmarks(
     enable_thinking=False,
     trust_remote_code=False,
 ):
-    """Evaluate local <benchmark_dir>/<language>/test.jsonl datasets.
+    """Evaluate local <benchmark_dir>/<language>/test.<language>.jsonl datasets.
 
     Pass the root folder and language subdirectory names for each benchmark.
     An empty language list skips that benchmark. No dataset is downloaded.

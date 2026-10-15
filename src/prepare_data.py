@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
@@ -370,6 +371,32 @@ def _load_json_dataset(path: Path) -> Dataset:
     return load_dataset("json", data_files=str(path), split="train")
 
 
+def normalize_globalmgsm_row(row: dict, language: str) -> dict:
+    """Extract Alpaca fields from GlobalMGSM's already-rendered prompt."""
+    prompt = str(row["prompt"] or "").strip()
+    if "### Instruction:" in prompt:
+        prefix, body = prompt.split("### Instruction:", 1)
+        body = body.split("### Response:", 1)[0].strip()
+        if "### Input:" in body:
+            instruction, input_text = body.split("### Input:", 1)
+        else:
+            instruction, input_text = body, ""
+        # Preserve the language directive carried in the original preamble.
+        directive = re.search(r"Please answer in [^.]+\.", prefix)
+        if directive:
+            instruction = directive.group(0) + "\n" + instruction.strip()
+    else:
+        instruction, input_text = prompt, ""
+    return {
+        "instruction": instruction.strip(),
+        "input": input_text.strip(),
+        "output": str(row["chosen"] or ""),
+        "language": language,
+        "dataset_name": "globalmgsm",
+        "prompt_preformatted": False,
+    }
+
+
 def load_instruction_dataset(
     xlsum_dir: str = "data/XLSum/XLSum",
     bactrian_dir: str = "data/Bactrian-Multilingual_Instruction",
@@ -428,14 +455,7 @@ def load_instruction_dataset(
             if not {"prompt", "chosen"}.issubset(raw.column_names):
                 raise ValueError(f"{path}: GlobalMGSM requires prompt and chosen fields")
             normalized = raw.map(
-                lambda row, code=lang: {
-                    "instruction": str(row["prompt"] or ""),
-                    "input": "",
-                    "output": str(row["chosen"] or ""),
-                    "language": code,
-                    "dataset_name": "globalmgsm",
-                    "prompt_preformatted": True,
-                },
+                lambda row, code=lang: normalize_globalmgsm_row(row, code),
                 remove_columns=raw.column_names,
                 desc=f"Preparing GlobalMGSM ({lang})",
             ).filter(lambda row: bool(row["instruction"].strip() and row["output"].strip()))
