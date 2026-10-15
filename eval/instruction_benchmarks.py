@@ -103,6 +103,20 @@ def build_mgsm_prompt(row):
     )
 
 
+def build_belebele_prompt(row):
+    """Render reading comprehension as an Alpaca instruction/input prompt."""
+    from src.prompts import instruction_prompt
+
+    options = '\n'.join(
+        f'{letter}. {row["mc_answer" + str(index)]}'
+        for index, letter in enumerate('ABCD', 1)
+    )
+    return instruction_prompt(
+        'Read the passage and answer the question. Answer with only A, B, C, or D.',
+        f'{row["flores_passage"]}\n\n{row["question"]}\n{options}',
+    )
+
+
 def run_instruction_benchmarks(
     model_name_or_path,
     *,
@@ -168,8 +182,7 @@ def run_instruction_benchmarks(
             if task == 'mgsm':
                 prompt = build_mgsm_prompt(row)
             else:
-                options = '\n'.join(f'{letter}. {row["mc_answer" + str(i)]}' for i, letter in enumerate('ABCD', 1))
-                prompt = f'{row["flores_passage"]}\n\n{row["question"]}\n{options}\nAnswer with only A, B, C, or D.'
+                prompt = build_belebele_prompt(row)
             if use_chat_template:
                 prompt = tokenizer.apply_chat_template(
                     [{'role': 'user', 'content': prompt}], tokenize=False,
