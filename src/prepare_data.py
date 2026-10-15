@@ -376,14 +376,22 @@ def load_instruction_dataset(
     languages: str = "en,km,my,th,vi",
     bactrian_validation_ratio: float = 0.01,
     seed: int = 42,
+    instruction_datasets: str = "xlsum,bactrian",
+    globalmgsm_dir: str = "data/GlobalMGSM",
+    globalmgsm_validation_ratio: float = 0.01,
 ) -> DatasetDict:
+    enabled = {name.strip().lower() for name in instruction_datasets.split(",") if name.strip()}
+    if not enabled or enabled - {"xlsum", "bactrian", "globalmgsm"}:
+        raise ValueError("instruction_datasets must select xlsum, bactrian, and/or globalmgsm")
+    if "globalmgsm" in enabled and not 0 < globalmgsm_validation_ratio < 1:
+        raise ValueError("globalmgsm_validation_ratio must be between 0 and 1")
     selected = [x.strip() for x in languages.split(",") if x.strip()]
     train_parts, validation_parts = [], []
     for lang in selected:
         xlsum_root = Path(xlsum_dir) / lang
         for split_name, destination in (("train", train_parts), ("validation", validation_parts)):
             path = xlsum_root / f"{split_name}.{lang}.json"
-            if path.exists():
+            if "xlsum" in enabled and path.exists():
                 raw = _load_json_dataset(path)
                 destination.append(raw.map(
                     lambda row, code=lang: {
@@ -398,7 +406,7 @@ def load_instruction_dataset(
                 ))
 
         bactrian_path = Path(bactrian_dir) / f"{lang}.json"
-        if bactrian_path.exists():
+        if "bactrian" in enabled and bactrian_path.exists():
             raw = _load_json_dataset(bactrian_path)
             normalized = raw.map(
                 lambda row, code=lang: {
@@ -414,8 +422,40 @@ def load_instruction_dataset(
             split = normalized.train_test_split(test_size=bactrian_validation_ratio, seed=seed)
             train_parts.append(split["train"])
             validation_parts.append(split["test"])
+        if "globalmgsm" in enabled:
+            path = Path(globalmgsm_dir) / lang / f"train.{lang}.jsonl"
+            raw = _load_json_dataset(path)
+            if not {"prompt", "chosen"}.issubset(raw.column_names):
+                raise ValueError(f"{path}: GlobalMGSM requires prompt and chosen fields")
+            normalized = raw.map(
+                lambda row, code=lang: {
+                    "instruction": str(row["prompt"] or ""),
+                    "input": "",
+                    "output": str(row["chosen"] or ""),
+                    "language": code,
+                    "dataset_name": "globalmgsm",
+                    "prompt_preformatted": True,
+                },
+                remove_columns=raw.column_names,
+                desc=f"Preparing GlobalMGSM ({lang})",
+            ).filter(lambda row: bool(row["instruction"].strip() and row["output"].strip()))
+            if len(normalized) < 2:
+                raise ValueError(f"{path}: need at least two valid training samples")
+            # Hold out validation from TRAIN only; benchmark test stays untouched.
+            split = normalized.train_test_split(
+                test_size=globalmgsm_validation_ratio, seed=seed,
+            )
+            train_parts.append(split["train"])
+            validation_parts.append(split["test"])
     if not train_parts or not validation_parts:
         raise ValueError(f"No usable instruction data for languages: {languages}")
+    # Keep a common schema when mixing pre-rendered prompts with other datasets.
+    train_parts = [part if "prompt_preformatted" in part.column_names else part.add_column(
+        "prompt_preformatted", [False] * len(part)
+    ) for part in train_parts]
+    validation_parts = [part if "prompt_preformatted" in part.column_names else part.add_column(
+        "prompt_preformatted", [False] * len(part)
+    ) for part in validation_parts]
     return DatasetDict(
         train=concatenate_datasets(train_parts).shuffle(seed=seed),
         validation=concatenate_datasets(validation_parts).shuffle(seed=seed),

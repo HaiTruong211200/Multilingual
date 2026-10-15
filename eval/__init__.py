@@ -2,7 +2,14 @@
 
 from typing import Any
 
+
+def run_instruction_benchmarks(*args: Any, **kwargs: Any):
+    from .instruction_benchmarks import run_instruction_benchmarks as implementation
+
+    return implementation(*args, **kwargs)
+
 __all__ = [
+    "run_instruction_benchmarks",
     "evaluate_folder_sentence_bleu",
     "build_embeddings_dict",
     "extract_all_layer_embeddings",

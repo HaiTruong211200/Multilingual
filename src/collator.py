@@ -313,9 +313,15 @@ class InstructionDataCollator:
         rows = []
         eos_id = self.tokenizer.eos_token_id
         for row in features:
-            prompt_ids = self._prompt_ids(
-                str(row["instruction"]), str(row.get("input") or "")
-            )
+            if row.get("prompt_preformatted", False) and self.prompt_format != "chat":
+                # GlobalMGSM already includes instruction/response markers.
+                prompt_ids = self.tokenizer(
+                    str(row["instruction"]), add_special_tokens=True
+                )["input_ids"]
+            else:
+                prompt_ids = self._prompt_ids(
+                    str(row["instruction"]), str(row.get("input") or "")
+                )
             response_ids = self.tokenizer(
                 str(row["output"]), add_special_tokens=False
             )["input_ids"]

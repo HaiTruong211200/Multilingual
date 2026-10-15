@@ -245,6 +245,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--direction", choices=["forward", "reverse", "both"], default="forward")
     parser.add_argument("--xlsum_dir", default="data/XLSum/XLSum")
     parser.add_argument("--bactrian_dir", default="data/Bactrian-Multilingual_Instruction")
+    parser.add_argument("--instruction_datasets", default="xlsum,bactrian",
+                        help="Comma-separated selection: xlsum,bactrian,globalmgsm")
+    parser.add_argument("--globalmgsm_dir", default="data/GlobalMGSM")
+    parser.add_argument("--globalmgsm_validation_ratio", type=float, default=0.01)
     parser.add_argument("--languages", default="en,km,my,th,vi")
     parser.add_argument("--bactrian_validation_ratio", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=512)
@@ -425,6 +429,9 @@ def build_stage(args, tokenizer):
     dataset = load_instruction_dataset(
         args.xlsum_dir, args.bactrian_dir, args.languages,
         args.bactrian_validation_ratio, args.seed,
+        instruction_datasets=args.instruction_datasets,
+        globalmgsm_dir=args.globalmgsm_dir,
+        globalmgsm_validation_ratio=args.globalmgsm_validation_ratio,
     )
     model = load_causal_lm(args.model_name_or_path, args.trust_remote_code)
     model = apply_lora(model, args)
@@ -539,6 +546,13 @@ def main() -> None:
             "--prompt_format chat was requested but tokenizer.chat_template is empty."
         )
     dataset, model, collator = build_stage(args, tokenizer)
+    if args.stage == "instruction":
+        LOGGER.info("Instruction datasets=%s | GlobalMGSM=%s | validation_from_train=%g",
+                    args.instruction_datasets, args.globalmgsm_dir, args.globalmgsm_validation_ratio)
+        for split_name in ("train", "validation"):
+            from collections import Counter
+            LOGGER.info("%s dataset counts=%s", split_name,
+                        dict(Counter(dataset[split_name]["dataset_name"])))
     LOGGER.info(
         "Dataset built | train=%d | validation=%d | columns=%s",
         len(dataset["train"]), len(dataset["validation"]),

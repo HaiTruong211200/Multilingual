@@ -9,6 +9,9 @@ MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-outputs/stage1-multilingual-alignment}
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/stage2-instruction-ft}"
 XLSUM_DIR="${XLSUM_DIR:-data/XLSum/XLSum}"
 BACTRIAN_DIR="${BACTRIAN_DIR:-data/Bactrian-Multilingual_Instruction}"
+# Select any subset: xlsum,bactrian,globalmgsm. Use globalmgsm for MGSM-only SFT.
+INSTRUCTION_DATASETS="${INSTRUCTION_DATASETS:-xlsum,bactrian}"
+GLOBALMGSM_DIR="${GLOBALMGSM_DIR:-data/GlobalMGSM}"
 LANGUAGES="${LANGUAGES:-en,km,my,th,vi}"
 PRECISION="${PRECISION:-bf16}"
 
@@ -20,6 +23,9 @@ ARGS=(
   --model_name_or_path "$MODEL_NAME_OR_PATH"
   --xlsum_dir "$XLSUM_DIR"
   --bactrian_dir "$BACTRIAN_DIR"
+  --instruction_datasets "$INSTRUCTION_DATASETS"
+  --globalmgsm_dir "$GLOBALMGSM_DIR"
+  --globalmgsm_validation_ratio "${GLOBALMGSM_VALIDATION_RATIO:-0.01}"
   --languages "$LANGUAGES"
   --output_dir "$OUTPUT_DIR"
   --prompt_format "${PROMPT_FORMAT:-plain}"
