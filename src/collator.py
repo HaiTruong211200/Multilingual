@@ -178,6 +178,14 @@ class MultilingualDataCollator:
                     [item["target_end_positions"] for item in features]
                 ),
                 "alignment_source_input_ids": alignment_source_input_ids,
+                "source_is_english": torch.tensor([
+                    str(item.get("source_lang", "")).strip().lower() in {"en", "eng", "eng_latn", "english"}
+                    for item in features
+                ], dtype=torch.bool),
+                "target_is_english": torch.tensor([
+                    str(item.get("target_lang", "")).strip().lower() in {"en", "eng", "eng_latn", "english"}
+                    for item in features
+                ], dtype=torch.bool),
                 "alignment_source_attention_mask": alignment_source_attention_mask,
                 "alignment_source_content_mask": alignment_source_content_mask,
                 "alignment_target_input_ids": alignment_target_input_ids,

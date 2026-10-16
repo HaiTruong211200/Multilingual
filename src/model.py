@@ -12,6 +12,7 @@ from torch import nn
 from transformers import AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import PeftConfig, PeftModel
+from .ot_distance import load_whitening, transport_cost, stop_gradient_rows
 
 
 @dataclass
@@ -59,6 +60,14 @@ class MultilingualAlignmentModel(nn.Module):
         ipot_inner_iterations: int = 1,
         attn_implementation: str = "eager",
         trust_remote_code: bool = False,
+        ot_distance: str = "cosine",
+        ot_covariance_path: Optional[str] = None,
+        ot_covariance_regularization: float = 1e-4,
+        ot_covariance_auto: bool = False,
+        ot_whitening_method: str = "ridge",
+        ot_eigenvalue_threshold: float = 1e-5,
+        ot_stop_gradient_english: bool = False,
+        contrastive_stop_gradient_english: bool = False,
     ):
         super().__init__()
         self.lm = AutoModelForCausalLM.from_pretrained(
@@ -67,6 +76,21 @@ class MultilingualAlignmentModel(nn.Module):
             attn_implementation=attn_implementation,
         )
         self.config = self.lm.config
+        if ot_distance not in {"cosine", "squared_euclidean", "mahalanobis"}:
+            raise ValueError(f"Unsupported OT distance: {ot_distance}")
+        self.ot_distance = ot_distance
+        self.ot_stop_gradient_english = ot_stop_gradient_english
+        self.contrastive_stop_gradient_english = contrastive_stop_gradient_english
+        whitening = None
+        if ot_distance == "mahalanobis":
+            if not ot_covariance_path and not ot_covariance_auto:
+                raise ValueError("ot_covariance_path is required for Mahalanobis distance")
+            if ot_covariance_path:
+                whitening = load_whitening(
+                    ot_covariance_path, self.config.hidden_size, ot_covariance_regularization,
+                    method=ot_whitening_method, relative_threshold=ot_eigenvalue_threshold,
+                )
+        self.register_buffer("ot_whitening", whitening)
         self.contrastive_weight = contrastive_weight
         self.ot_weight = ot_weight
         self.structure_weight = structure_weight
@@ -199,7 +223,8 @@ class MultilingualAlignmentModel(nn.Module):
         # neighborhood differences would otherwise underflow unnecessarily.
         return row_kl[valid_rows].mean()
 
-    def _contrastive(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    def _contrastive(self, src: torch.Tensor, tgt: torch.Tensor,
+                     source_is_english=None, target_is_english=None) -> torch.Tensor:
         """Within-instruction contrastive loss following the reference Llama model.
 
         Rows/columns contain all in-batch source-target pairs; diagonal entries
@@ -208,6 +233,13 @@ class MultilingualAlignmentModel(nn.Module):
         """
         if src.size(0) <= 1:
             return src.new_zeros(())
+        if self.contrastive_stop_gradient_english:
+            if source_is_english is None or target_is_english is None:
+                raise ValueError("Contrastive English stop-gradient requires language flags from the collator")
+            # English vectors remain in both positive and negative pairs, but
+            # receive no gradient through this contrastive embedding branch.
+            src = stop_gradient_rows(src, source_is_english)
+            tgt = stop_gradient_rows(tgt, target_is_english)
         similarity = F.cosine_similarity(src[:, None, :], tgt[None, :, :], dim=-1)
         log_prob = F.log_softmax(similarity / self.temperature, dim=0)
         return -torch.diagonal(log_prob).mean() / 2.0
@@ -266,9 +298,7 @@ class MultilingualAlignmentModel(nn.Module):
 
             x = src[valid].float().masked_fill(~sm.unsqueeze(-1), 0.0)
             y = tgt[valid].float().masked_fill(~tm.unsqueeze(-1), 0.0)
-            x = F.normalize(x, dim=-1, eps=1e-6)
-            y = F.normalize(y, dim=-1, eps=1e-6)
-            cost = (1.0 - torch.bmm(x, y.transpose(1, 2))).clamp(0, 2)
+            cost = transport_cost(x, y, self.ot_distance, self.ot_whitening)
 
             log_K = -cost / self.sinkhorn_epsilon
             log_a = a.masked_fill(~sm, 1.0).log()
@@ -329,9 +359,7 @@ class MultilingualAlignmentModel(nn.Module):
 
             x = src[valid].float().masked_fill(~sm.unsqueeze(-1), 0.0)
             y = tgt[valid].float().masked_fill(~tm.unsqueeze(-1), 0.0)
-            x = F.normalize(x, dim=-1, eps=1e-6)
-            y = F.normalize(y, dim=-1, eps=1e-6)
-            cost = (1.0 - torch.bmm(x, y.transpose(1, 2))).clamp(0, 2)
+            cost = transport_cost(x, y, self.ot_distance, self.ot_whitening)
 
             log_A = -cost / self.ipot_beta
             log_a = a.masked_fill(~sm, 1.0).log()
@@ -377,7 +405,17 @@ class MultilingualAlignmentModel(nn.Module):
         tgt_mask: torch.Tensor,
         source_mass: torch.Tensor,
         target_mass: torch.Tensor,
+        source_is_english: Optional[torch.Tensor] = None,
+        target_is_english: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.ot_stop_gradient_english:
+            if source_is_english is None or target_is_english is None:
+                raise ValueError("OT English stop-gradient requires language flags from the collator")
+            # Stop both hidden-state and attention-mass paths on English sides.
+            src = stop_gradient_rows(src, source_is_english)
+            tgt = stop_gradient_rows(tgt, target_is_english)
+            source_mass = stop_gradient_rows(source_mass, source_is_english)
+            target_mass = stop_gradient_rows(target_mass, target_is_english)
         solver = self._ipot_ot if self.ot_solver == "ipot" else self._sinkhorn_ot
         return solver(src, tgt, src_mask, tgt_mask, source_mass, target_mass)
 
@@ -400,6 +438,9 @@ class MultilingualAlignmentModel(nn.Module):
         reverse_attention_mask: Optional[torch.Tensor] = None,
         reverse_target_start_positions: Optional[torch.Tensor] = None,
         reverse_target_end_positions: Optional[torch.Tensor] = None,
+        loss_objective: str = "joint",
+        source_is_english: Optional[torch.Tensor] = None,
+        target_is_english: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         # ------------------------------------------------------------------
@@ -410,9 +451,11 @@ class MultilingualAlignmentModel(nn.Module):
         # joint/bidirectional. Source-only and target-only forwards are shared
         # when both CL and OT choose independent.
         # ------------------------------------------------------------------
-        compute_contrastive = self.contrastive_weight != 0.0
-        compute_ot = self.ot_weight != 0.0
-        compute_structure = self.structure_weight != 0.0
+        if loss_objective not in {"joint", "alignment", "sft"}:
+            raise ValueError(f"Unknown loss_objective: {loss_objective}")
+        compute_contrastive = self.contrastive_weight != 0.0 and loss_objective != "sft"
+        compute_ot = self.ot_weight != 0.0 and loss_objective != "sft"
+        compute_structure = self.structure_weight != 0.0 and loss_objective != "sft"
         need_joint = (
             compute_contrastive and self.contrastive_forward_mode == "joint"
         ) or (
@@ -579,6 +622,7 @@ class MultilingualAlignmentModel(nn.Module):
                         contrastive_hidden,
                         joint_target_mask.to(contrastive_hidden.device),
                     ),
+                    source_is_english, target_is_english,
                 )
             else:
                 source_contrastive = source_output.hidden_states[self.align_layer]
@@ -592,6 +636,7 @@ class MultilingualAlignmentModel(nn.Module):
                         target_contrastive,
                         target_mask.to(target_contrastive.device),
                     ),
+                    source_is_english, target_is_english,
                 )
 
         # ------------------------------------------------------------------
@@ -601,7 +646,7 @@ class MultilingualAlignmentModel(nn.Module):
         # - bidirectional: OT(H_y|x, H_x|y), requiring one reverse prompt.
         #
         # Marginals mix attention salience with a uniform distribution. The
-        # transport cost itself is cosine distance inside _optimal_transport.
+        # Both solvers use the selected distance via transport_cost.
         # ------------------------------------------------------------------
         if compute_ot:
             if self.ot_forward_mode == "joint":
@@ -628,6 +673,7 @@ class MultilingualAlignmentModel(nn.Module):
                     joint_target_mask,
                     source_mass.to(joint_alignment_hidden.device),
                     target_mass.to(joint_alignment_hidden.device),
+                    source_is_english, target_is_english,
                 )
             elif self.ot_forward_mode == "independent":
                 # No cross-sentence attention exists here. Each marginal is
@@ -659,6 +705,7 @@ class MultilingualAlignmentModel(nn.Module):
                     target_mask.to(source_alignment_hidden.device),
                     source_mass.to(source_alignment_hidden.device),
                     target_mass.to(source_alignment_hidden.device),
+                    source_is_english, target_is_english,
                 )
             else:
                 # Reverse prompt is (instruction target->source, target, source).
@@ -728,6 +775,7 @@ class MultilingualAlignmentModel(nn.Module):
                     reverse_target_mask.to(joint_alignment_hidden.device),
                     forward_mass.to(joint_alignment_hidden.device),
                     reverse_mass.to(joint_alignment_hidden.device),
+                    target_is_english, source_is_english,
                 )
         # Usually all three losses are already colocated. Explicit movement is
         # required for model/tensor parallel layouts where alignment hidden
@@ -741,7 +789,8 @@ class MultilingualAlignmentModel(nn.Module):
         weighted_ot = self.ot_weight * ot
         weighted_structure = self.structure_weight * structure
         total_loss = (
-            ntp_loss + weighted_contrastive + weighted_ot + weighted_structure
+            (ntp_loss if loss_objective != "alignment" else ntp_loss * 0)
+            + weighted_contrastive + weighted_ot + weighted_structure
         )
         return AlignmentCausalLMOutputWithPast(
             loss=total_loss,

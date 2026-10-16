@@ -14,6 +14,7 @@ PRECISION="${PRECISION:-bf16}"
 ARGS=(
   -m src.train
   --stage alignment
+  --loss_schedule "${LOSS_SCHEDULE:-joint}"
   --model_name_or_path "$MODEL_NAME_OR_PATH"
   --data_dir "$DATA_DIR"
   --language_pairs "${LANGUAGE_PAIRS:-all}"
@@ -31,6 +32,13 @@ ARGS=(
   --structure_temperature "${STRUCTURE_TEMPERATURE:-0.1}"
   --attention_mass_weight "${ATTENTION_MASS_WEIGHT:-0.5}"
   --ot_solver "${OT_SOLVER:-sinkhorn}"
+  --ot_distance "${OT_DISTANCE:-cosine}"
+  --ot_covariance_regularization "${OT_COVARIANCE_REGULARIZATION:-0.0001}"
+  --ot_whitening_method "${OT_WHITENING_METHOD:-truncated}"
+  --ot_eigenvalue_threshold "${OT_EIGENVALUE_THRESHOLD:-0.00001}"
+  --ot_calibration_samples_per_language "${OT_CALIBRATION_SAMPLES_PER_LANGUAGE:-1024}"
+  --ot_calibration_batch_size "${OT_CALIBRATION_BATCH_SIZE:-8}"
+  --ot_calibration_max_length "${OT_CALIBRATION_MAX_LENGTH:-256}"
   --learning_rate "${LEARNING_RATE:-2e-5}"
   --epochs "${EPOCHS:-3}"
   --batch_size "${BATCH_SIZE:-2}"
@@ -80,6 +88,24 @@ fi
 
 if [[ "${BATCH_BY_LANGUAGE_PAIR:-false}" == "true" ]]; then
   ARGS+=(--batch_by_language_pair)
+fi
+
+if [[ -n "${OT_COVARIANCE_PATH:-}" ]]; then
+  ARGS+=(--ot_covariance_path "$OT_COVARIANCE_PATH")
+fi
+if [[ "${OT_COVARIANCE_AUTO:-true}" == "true" ]]; then
+  ARGS+=(--ot_covariance_auto)
+else
+  ARGS+=(--no-ot_covariance_auto)
+fi
+if [[ "${OT_STOP_GRADIENT_ENGLISH:-false}" == "true" ]]; then
+  ARGS+=(--ot_stop_gradient_english)
+fi
+if [[ "${CONTRASTIVE_STOP_GRADIENT_ENGLISH:-false}" == "true" ]]; then
+  ARGS+=(--contrastive_stop_gradient_english)
+fi
+if [[ -n "${OT_COVARIANCE_CACHE:-}" ]]; then
+  ARGS+=(--ot_covariance_cache "$OT_COVARIANCE_CACHE")
 fi
 
 if [[ "$PRECISION" == "bf16" ]]; then

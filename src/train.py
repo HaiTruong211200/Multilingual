@@ -16,6 +16,8 @@ from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dic
 from .collator import InstructionDataCollator, MultilingualDataCollator
 from .model import MultilingualAlignmentModel
 from .sampler import LanguagePairSampler
+from .ot_calibration import calibrate_covariance
+from .ot_distance import load_whitening
 from .prepare_data import (
     load_instruction_dataset,
     load_parallel_dataset,
@@ -40,12 +42,24 @@ class ComponentLoggingTrainer(Trainer):
         *args,
         stage: str,
         batch_by_language_pair: bool = False,
+        loss_schedule: str = "joint",
         sinkhorn_epsilon_schedule: str = "constant",
         sinkhorn_epsilon_end: float = 0.01,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.stage = stage
+        self.loss_schedule = loss_schedule
+        self._microbatch_index = 0
+        self._active_objective = "joint"
+        if loss_schedule != "joint":
+            if stage != "alignment":
+                raise ValueError("Alternating objectives are supported only for Stage 1")
+            unwrapped = self.accelerator.unwrap_model(self.model)
+            if not any(getattr(unwrapped, key, 0) != 0 for key in (
+                "contrastive_weight", "ot_weight", "structure_weight"
+            )):
+                raise ValueError("Alternating objectives require a nonzero alignment loss weight")
         self.batch_by_language_pair = batch_by_language_pair
         if batch_by_language_pair and stage != "alignment":
             raise ValueError("batch_by_language_pair is supported only for alignment training")
@@ -102,9 +116,31 @@ class ComponentLoggingTrainer(Trainer):
             * cosine_factor
         )
 
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        # Increment once per backward micro-batch, never during evaluation.
+        if self.loss_schedule != "joint":
+            sft_only = (
+                self.loss_schedule == "alternate_microbatch_then_sft"
+                and self.state.global_step >= math.ceil(self.state.max_steps / 2)
+            )
+            self._active_objective = (
+                "sft" if sft_only or self._microbatch_index % 2 else "alignment"
+            )
+        try:
+            result = super().training_step(model, inputs, num_items_in_batch)
+            self._microbatch_index += 1
+            return result
+        finally:
+            self._active_objective = "joint"
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if model.training:
             self._update_sinkhorn_epsilon(model)
+            if self.loss_schedule != "joint":
+                inputs = {**inputs, "loss_objective": self._active_objective}
+                self._sums["train"]["alignment_microbatch_fraction"] += float(
+                    self._active_objective == "alignment"
+                )
         # Delegate the actual loss computation to Hugging Face Trainer so label
         # smoothing, custom loss functions, item-count normalization, and future
         # Trainer behavior remain intact. This override only observes the output.
@@ -232,6 +268,10 @@ class ComponentLoggingTrainer(Trainer):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True, choices=["alignment", "instruction"])
+    parser.add_argument(
+        "--loss_schedule", default="joint",
+        choices=["joint", "alternate_microbatch", "alternate_microbatch_then_sft"],
+    )
     parser.add_argument("--model_name_or_path", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--data_dir", default="data/MT")
@@ -289,6 +329,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--attention_mass_weight", type=float, default=0.5)
     parser.add_argument("--ot_solver", choices=["sinkhorn", "ipot"], default="sinkhorn")
+    parser.add_argument("--ot_distance", default="cosine",
+                        choices=["cosine", "squared_euclidean", "mahalanobis"])
+    parser.add_argument("--ot_covariance_path", default=None)
+    parser.add_argument("--ot_covariance_regularization", type=float, default=1e-4)
+    parser.add_argument("--ot_covariance_auto", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ot_stop_gradient_english", action=argparse.BooleanOptionalAction,
+                        default=False, help="Detach English representations and masses for OT only")
+    parser.add_argument("--contrastive_stop_gradient_english", action=argparse.BooleanOptionalAction,
+                        default=False, help="Detach English embeddings for contrastive loss")
+    parser.add_argument("--ot_covariance_cache", default=None)
+    parser.add_argument("--ot_whitening_method", choices=["ridge", "truncated"], default="truncated")
+    parser.add_argument("--ot_eigenvalue_threshold", type=float, default=1e-5)
+    parser.add_argument("--ot_calibration_samples_per_language", type=int, default=1024)
+    parser.add_argument("--ot_calibration_batch_size", type=int, default=8)
+    parser.add_argument("--ot_calibration_max_length", type=int, default=256)
     parser.add_argument("--sinkhorn_epsilon", type=float, default=0.1)
     parser.add_argument(
         "--sinkhorn_epsilon_schedule",
@@ -395,6 +450,7 @@ def build_stage(args, tokenizer):
             args.data_dir, args.language_pairs, args.direction,
             args.train_file, args.validation_file,
         )
+        calibration_train = dataset["train"]
         dataset = prepare_alignment_dataset(
             dataset, tokenizer, args.prompt_format, args.enable_thinking,
             args.training_mode,
@@ -414,6 +470,14 @@ def build_stage(args, tokenizer):
             ot_forward_mode=args.ot_forward_mode,
             attention_mass_weight=args.attention_mass_weight,
             ot_solver=args.ot_solver,
+            ot_distance=args.ot_distance,
+            ot_covariance_path=args.ot_covariance_path,
+            ot_covariance_regularization=args.ot_covariance_regularization,
+            ot_covariance_auto=args.ot_covariance_auto,
+            ot_stop_gradient_english=args.ot_stop_gradient_english,
+            contrastive_stop_gradient_english=args.contrastive_stop_gradient_english,
+            ot_whitening_method=args.ot_whitening_method,
+            ot_eigenvalue_threshold=args.ot_eigenvalue_threshold,
             sinkhorn_epsilon=args.sinkhorn_epsilon,
             sinkhorn_iterations=args.sinkhorn_iterations,
             ipot_beta=args.ipot_beta,
@@ -423,6 +487,26 @@ def build_stage(args, tokenizer):
             trust_remote_code=args.trust_remote_code,
         )
         model.lm = apply_lora(model.lm, args)
+        if args.ot_distance == "mahalanobis" and not args.ot_covariance_path and args.ot_covariance_auto:
+            # Calibrate before training, using the same starting model/adapter.
+            # Move to the local rank's device before standalone forwards.
+            if torch.cuda.is_available():
+                model.lm.to(torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0"))))
+            covariance = calibrate_covariance(
+                model.lm, tokenizer, calibration_train,
+                args.ot_covariance_cache or str(Path(args.output_dir) / "ot_covariance.pt"),
+                layer=args.align_layer,
+                samples_per_language=args.ot_calibration_samples_per_language,
+                batch_size=args.ot_calibration_batch_size,
+                max_length=args.ot_calibration_max_length,
+                seed=args.seed, model_name=args.model_name_or_path,
+            )
+            model.ot_whitening = load_whitening(
+                covariance, model.config.hidden_size, args.ot_covariance_regularization,
+                method=args.ot_whitening_method, relative_threshold=args.ot_eigenvalue_threshold,
+            )
+            LOGGER.info("OT whitening fitted | method=%s | retained_rank=%d | LEACE=False",
+                        args.ot_whitening_method, model.ot_whitening.shape[1])
         collator = MultilingualDataCollator(tokenizer)
         return dataset, model, collator
 
@@ -546,6 +630,11 @@ def main() -> None:
             "--prompt_format chat was requested but tokenizer.chat_template is empty."
         )
     dataset, model, collator = build_stage(args, tokenizer)
+    if args.stage == "alignment":
+        LOGGER.info("OT distance=%s | covariance=%s | covariance_regularization=%g",
+                    args.ot_distance, args.ot_covariance_path, args.ot_covariance_regularization)
+        LOGGER.info("English stop-gradient | OT=%s | contrastive=%s | NTP/structure unchanged",
+                    args.ot_stop_gradient_english, args.contrastive_stop_gradient_english)
     if args.stage == "instruction":
         LOGGER.info("Instruction datasets=%s | GlobalMGSM=%s | validation_from_train=%g",
                     args.instruction_datasets, args.globalmgsm_dir, args.globalmgsm_validation_ratio)
@@ -612,6 +701,7 @@ def main() -> None:
         train_dataset=dataset["train"], eval_dataset=dataset["validation"],
         data_collator=collator,
         stage=args.stage,
+        loss_schedule=args.loss_schedule,
         batch_by_language_pair=args.batch_by_language_pair,
         sinkhorn_epsilon_schedule=args.sinkhorn_epsilon_schedule,
         sinkhorn_epsilon_end=args.sinkhorn_epsilon_end,
