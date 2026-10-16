@@ -12,13 +12,16 @@ def parse_answer(text, task):
     """Parse an explicit final answer; ambiguous choice outputs remain invalid."""
     text = text.split('</think>')[-1].strip()
     if task == 'belebele':
-        match = re.fullmatch(r'\s*([ABCD1-4])[.)]?\s*', text, re.I)
+        match = re.fullmatch(r'\s*([1-4])[.)]?\s*', text)
         if not match:
-            match = re.search(r'(?:Answer|Final answer)\s*:\s*([ABCD1-4])\b', text, re.I)
+            match = re.search(r'(?:Answer|Final answer)\s*:\s*([1-4])\b', text, re.I)
+        if not match:
+            # Accept a leading option followed by its answer text, e.g.
+            # "4. Polymorphic", "4) Polymorphic", or "(4) Polymorphic".
+            match = re.match(r'^\s*\(?([1-4])\s*[.)]\s+\S', text)
         if not match:
             return None
-        answer = match.group(1).upper()
-        return str('ABCD'.index(answer) + 1) if answer in 'ABCD' else answer
+        return match.group(1)
     text = text.replace(',', '')
     marked_answers = re.findall(
         r'(?:####|(?:Final\s+)?Answer\s*:)\s*([-+]?\d+(?:\.\d+)?)', text, re.I,
@@ -108,11 +111,11 @@ def build_belebele_prompt(row):
     from src.prompts import instruction_prompt
 
     options = '\n'.join(
-        f'{letter}. {row["mc_answer" + str(index)]}'
-        for index, letter in enumerate('ABCD', 1)
+        f'{index}. {row["mc_answer" + str(index)]}'
+        for index in range(1, 5)
     )
     return instruction_prompt(
-        'Read the passage and answer the question. Answer with only A, B, C, or D.',
+        'Read the passage and answer the question. Answer with only 1, 2, 3, or 4.',
         f'{row["flores_passage"]}\n\n{row["question"]}\n{options}',
     )
 
