@@ -303,6 +303,7 @@ def plot_multilingual_tsne_scatter(
     point_size: float = 14,
     alpha: float = 0.8,
     output_path: str | Path | None = None,
+    metric: str | None = None,
     show: bool = True,
 ):
     """Plot joint per-layer t-SNE projections with a global KDE background."""
@@ -365,7 +366,7 @@ def plot_multilingual_tsne_scatter(
         ).numpy()
         projected = TSNE(
             n_components=2,
-            metric="cosine",
+            metric=metric if metric is not None else "euclidean",
             perplexity=effective_perplexity,
             init="pca",
             learning_rate="auto",
@@ -420,6 +421,7 @@ def visualize_model_tsne(
     output_path: str | Path | None = "outputs/eval/tsne.png",
     trust_remote_code: bool = False,
     show: bool = True,
+    metric: str | None = None,
 ) -> dict:
     """Run the complete notebook pipeline with one reusable function call."""
     dataframe, pair_lengths, selected_files = load_parallel_mt50_json(
@@ -444,6 +446,7 @@ def visualize_model_tsne(
         cols=cols,
         output_path=output_path,
         show=show,
+        metric=metric
     )
     return {
         "dataframe": dataframe,
