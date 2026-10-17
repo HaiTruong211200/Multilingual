@@ -16,7 +16,7 @@ from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dic
 from .collator import InstructionDataCollator, MultilingualDataCollator
 from .model import MultilingualAlignmentModel
 from .sampler import LanguagePairSampler
-from .two_stream import PairedObjectiveDataset, RepeatObjectiveBatchSampler, ObjectiveStreamCollator
+from .two_stream import PairedObjectiveDataset, RepeatObjectiveBatchSampler, ObjectiveStreamCollator, CurriculumObjectiveSampler
 from .ot_calibration import calibrate_covariance
 from .ot_distance import load_whitening
 from .prepare_data import (
@@ -94,6 +94,15 @@ class ComponentLoggingTrainer(Trainer):
                 alignment, self._train_batch_size, self.accelerator.num_processes,
                 self.args.data_seed if self.args.data_seed is not None else self.args.seed,
             )
+            if dataset.sft_multiplier == 2:
+                if self.args.max_steps > 0:
+                    raise ValueError('2:1 curriculum uses num_train_epochs; max_steps override is not supported')
+                sampler = CurriculumObjectiveSampler(
+                    dataset, base, self.args.num_train_epochs, self.args.gradient_accumulation_steps,
+                )
+                LOGGER.info('Two streams | curriculum SFT:alignment=2:1 | alignment=%d | SFT=%d | epochs=%s',
+                            len(dataset.alignment), len(dataset.instruction), self.args.num_train_epochs)
+                return sampler
             sampler = RepeatObjectiveBatchSampler(base, base.global_batch_size)
             if len(sampler) == 0:
                 raise ValueError("Not enough parallel/instruction samples for one complete global batch")
@@ -153,8 +162,12 @@ class ComponentLoggingTrainer(Trainer):
             )
         if self.stage1_data_mode == "parallel_instruction":
             # Choose data and objective together; never apply alignment to SFT rows.
-            key = 'alignment_batch' if self._active_objective == 'alignment' else 'sft_batch'
-            inputs = inputs[key]
+            if 'stream_objective' in inputs:
+                self._active_objective = inputs['stream_objective']
+                inputs = inputs['stream_batch']
+            else:
+                key = 'alignment_batch' if self._active_objective == 'alignment' else 'sft_batch'
+                inputs = inputs[key]
         try:
             result = super().training_step(model, inputs, num_items_in_batch)
             self._microbatch_index += 1
@@ -305,7 +318,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1_balance_pairs", action=argparse.BooleanOptionalAction, default=True,
                         help="Undersample each directed alignment pair equally in two-stream mode")
     parser.add_argument("--stage1_samples_per_stream", type=int, default=None,
-                        help="Samples per stream; unset uses all SFT train in sft_first mode")
+                        help="SFT sample budget for then-SFT curriculum; otherwise samples per stream")
     parser.add_argument(
         "--loss_schedule", default="joint",
         choices=["joint", "alternate_microbatch", "alternate_microbatch_then_sft"],
@@ -560,6 +573,11 @@ def build_stage(args, tokenizer):
                 dataset['train'], instruction['train'], args.stage1_samples_per_stream, args.data_seed,
                 balance_pairs=args.stage1_balance_pairs,
                 sampling_order=args.stage1_sampling_order,
+                sft_multiplier=2 if args.loss_schedule == 'alternate_microbatch_then_sft' else 1,
+                batch_quantum=(
+                    args.batch_size * int(os.environ.get('WORLD_SIZE', max(torch.cuda.device_count(), 1)))
+                    * args.gradient_accumulation_steps
+                ) if args.loss_schedule == 'alternate_microbatch_then_sft' else 1,
             )
             instruction_collator = InstructionDataCollator(
                 tokenizer, args.max_length, args.prompt_format, args.enable_thinking, 'finetune',

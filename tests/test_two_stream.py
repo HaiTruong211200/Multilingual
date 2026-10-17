@@ -11,7 +11,7 @@ from transformers import PretrainedConfig, TrainingArguments
 from src.model import AlignmentCausalLMOutputWithPast
 from src.sampler import LanguagePairSampler
 from src.train import ComponentLoggingTrainer
-from src.two_stream import PairedObjectiveDataset, RepeatObjectiveBatchSampler, ObjectiveStreamCollator
+from src.two_stream import PairedObjectiveDataset, RepeatObjectiveBatchSampler, ObjectiveStreamCollator, CurriculumObjectiveSampler
 
 
 def collate(features):
@@ -45,6 +45,62 @@ class TinyModel(torch.nn.Module):
 
 
 class TwoStreamTests(unittest.TestCase):
+    def test_curriculum_trainer_crosses_phase_boundary(self):
+        alignment = Dataset.from_dict(dict(
+            kind=[1]*16, source_lang=['en']*16, target_lang=['vi']*8+['zh']*8,
+        ))
+        instruction = Dataset.from_dict(dict(kind=[2]*24))
+        paired = PairedObjectiveDataset(
+            alignment, instruction, sampling_order='sft_first',
+            sft_multiplier=2, batch_quantum=4,
+        )
+        for epochs in (1, 2):
+            model = TinyModel()
+            with tempfile.TemporaryDirectory() as output:
+                args = TrainingArguments(
+                    output_dir=output, use_cpu=True, num_train_epochs=epochs,
+                    per_device_train_batch_size=2, gradient_accumulation_steps=2,
+                    remove_unused_columns=False, report_to=[], save_strategy='no',
+                    logging_strategy='no', disable_tqdm=True, dataloader_pin_memory=False,
+                )
+                trainer = ComponentLoggingTrainer(
+                    model=model, args=args, stage='alignment',
+                    loss_schedule='alternate_microbatch_then_sft',
+                    stage1_data_mode='parallel_instruction', batch_by_language_pair=True,
+                    train_dataset=paired, data_collator=ObjectiveStreamCollator(collate, collate),
+                )
+                trainer.train()
+                objectives = [objective for objective, _ in model.seen]
+                self.assertEqual(objectives, ['sft','alignment']*(4*epochs)+['sft']*(4*epochs))
+
+    def test_curriculum_uses_unique_sft_and_two_to_one_budget(self):
+        from collections import Counter
+        alignment = Dataset.from_dict(dict(
+            id=list(range(20)), kind=[1]*20,
+            source_lang=['en']*20, target_lang=['vi']*10+['zh']*10,
+        ))
+        instruction = Dataset.from_dict(dict(id=list(range(32)), kind=[2]*32))
+        paired = PairedObjectiveDataset(
+            alignment, instruction, sampling_order='sft_first',
+            sft_multiplier=2, batch_quantum=4,
+        )
+        self.assertEqual(len(paired.alignment), 16)
+        self.assertEqual(len(paired.instruction), 32)
+        base = LanguagePairSampler(paired.alignment, 2, 2)
+        sampler = CurriculumObjectiveSampler(paired, base, 1, 1)
+        indices = list(sampler)
+        self.assertEqual(len(indices), 48)
+        self.assertEqual(len(set(indices)), 48)
+        kinds = [paired[i]['stream_objective'] for i in indices[::4]]
+        self.assertEqual(kinds, ['sft','alignment']*4+['sft']*4)
+        # Across two epochs, every record has exactly two total exposures.
+        sampler = CurriculumObjectiveSampler(paired, base, 2, 1)
+        all_indices = []
+        for epoch in range(2):
+            sampler.set_epoch(epoch)
+            all_indices.extend(list(sampler))
+        self.assertEqual(set(Counter(all_indices).values()), {2})
+
     def test_sft_first_keeps_sft_budget(self):
         from collections import Counter
         alignment = Dataset.from_dict(dict(

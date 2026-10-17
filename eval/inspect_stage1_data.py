@@ -29,19 +29,26 @@ def _ratio_table(available, selected, usable, columns, extra_keys=()):
 def inspect_selected_streams(paired, alignment_available, instruction_available,
                              *, batch_size=2, world_size=1,
                              batch_by_language_pair=False, data_seed=42,
-                             languages=()):
+                             languages=(), epochs=1, gradient_accumulation_steps=1):
     """Summarize selected samples and the first epoch's dropped-tail effects."""
     from src.sampler import LanguagePairSampler
 
     sampler_data = paired.alignment
     if not batch_by_language_pair:
         sampler_data = sampler_data.remove_columns(['source_lang', 'target_lang'])
-        sampler_data = sampler_data.add_column('source_lang', ['all'] * len(paired))
-        sampler_data = sampler_data.add_column('target_lang', ['all'] * len(paired))
+        sampler_data = sampler_data.add_column('source_lang', ['all'] * len(paired.alignment))
+        sampler_data = sampler_data.add_column('target_lang', ['all'] * len(paired.alignment))
     sampler = LanguagePairSampler(sampler_data, batch_size, world_size, data_seed)
-    indices = list(sampler)
-    alignment_usable = paired.alignment.select(indices)
-    instruction_usable = paired.instruction.select(indices)
+    if paired.sft_multiplier == 2:
+        from src.two_stream import CurriculumObjectiveSampler
+        planned = list(CurriculumObjectiveSampler(paired, sampler, epochs, gradient_accumulation_steps))
+        boundary = len(paired.alignment)
+        alignment_usable = paired.alignment.select([i for i in planned if i < boundary])
+        instruction_usable = paired.instruction.select([i - boundary for i in planned if i >= boundary])
+    else:
+        indices = list(sampler)
+        alignment_usable = paired.alignment.select(indices)
+        instruction_usable = paired.instruction.select(indices)
     result = {}
     for name, before, after, usable, columns in (
         ('alignment_pairs', alignment_available, paired.alignment, alignment_usable,
@@ -59,8 +66,8 @@ def inspect_selected_streams(paired, alignment_available, instruction_available,
             extra_keys=[(lang,) for lang in languages] if name == 'sft_languages' else (),
         )
     print(f'Global batch size: {batch_size * world_size}')
-    print(f'Selected per stream: {len(paired)}; usable per stream: {len(indices)}; '
-          f'dropped per stream: {len(paired) - len(indices)}')
+    print(f'Selected alignment={len(paired.alignment)}, SFT={len(paired.instruction)}; '
+          f'epoch 1 exposures: alignment={len(alignment_usable)}, SFT={len(instruction_usable)}')
     print('Available: training pools AFTER validation split. Selected: sampled pools. '
           'Usable: first epoch after dropping incomplete global batches.')
     print('SFT languages are NOT quota-balanced; shuffle preserves no exact language ratio.')
@@ -89,6 +96,9 @@ def inspect_stage1_data(
     stage1_samples_per_stream=None,
     stage1_balance_pairs=True,
     sampling_order='sft_first',
+    loss_schedule='alternate_microbatch_then_sft',
+    gradient_accumulation_steps=1,
+    epochs=1,
     batch_by_language_pair=False,
     batch_size=2,
     world_size=1,
@@ -123,11 +133,14 @@ def inspect_stage1_data(
         alignment['train'], instruction['train'], stage1_samples_per_stream,
         data_seed, balance_pairs=stage1_balance_pairs,
         sampling_order=sampling_order,
+        sft_multiplier=2 if loss_schedule == 'alternate_microbatch_then_sft' else 1,
+        batch_quantum=batch_size * world_size * gradient_accumulation_steps,
     )
     return inspect_selected_streams(
         paired, alignment['train'], instruction['train'], batch_size=batch_size,
         world_size=world_size, batch_by_language_pair=batch_by_language_pair,
         data_seed=data_seed, languages=[lang.strip() for lang in languages.split(',') if lang.strip()],
+        epochs=epochs, gradient_accumulation_steps=gradient_accumulation_steps,
     )
 
 
@@ -147,6 +160,9 @@ if __name__ == '__main__':
     parser.add_argument('--globalmgsm_validation_ratio', type=float, default=0.01)
     parser.add_argument('--stage1_samples_per_stream', type=int)
     parser.add_argument('--sampling_order', choices=['joint_limit', 'sft_first'], default='sft_first')
+    parser.add_argument('--loss_schedule', choices=['alternate_microbatch', 'alternate_microbatch_then_sft'], default='alternate_microbatch_then_sft')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
+    parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--stage1_balance_pairs', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--batch_by_language_pair', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--batch_size', type=int, default=2)
