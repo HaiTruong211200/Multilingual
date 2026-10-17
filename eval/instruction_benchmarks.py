@@ -16,20 +16,22 @@ def parse_answer(text, task):
         # new Alpaca sections or additional answers after already answering.
         # Never use numbers from those generated sections or explanations.
         first_line = text.splitlines()[0].strip() if text else ''
-        match = re.fullmatch(r'([1-4])[.)]?', first_line)
+        match = re.fullmatch(r'([ABCD1-4])[.)]?', first_line, re.I)
         if match:
-            return match.group(1)
+            answer = match.group(1).upper()
+            return str('ABCD'.index(answer) + 1) if answer in 'ABCD' else answer
         text = re.split(r'(?m)^\s*#{3,}', text, maxsplit=1)[0].strip()
-        match = re.fullmatch(r'\s*([1-4])[.)]?\s*', text)
+        match = re.fullmatch(r'\s*([ABCD1-4])[.)]?\s*', text, re.I)
         if not match:
-            match = re.search(r'(?:Answer|Final answer)\s*:\s*([1-4])\b', text, re.I)
+            match = re.search(r'(?:Answer|Final answer)\s*:\s*([ABCD1-4])\b', text, re.I)
         if not match:
             # Accept a leading option followed by its answer text, e.g.
-            # "4. Polymorphic", "4) Polymorphic", or "(4) Polymorphic".
-            match = re.match(r'^\s*\(?([1-4])\s*[.)]\s+\S', text)
+            # "D. Polymorphic", "4) Polymorphic", or "(D) Polymorphic".
+            match = re.match(r'^\s*\(?([ABCD1-4])\s*[.)]\s+\S', text, re.I)
         if not match:
             return None
-        return match.group(1)
+        answer = match.group(1).upper()
+        return str('ABCD'.index(answer) + 1) if answer in 'ABCD' else answer
     text = text.replace(',', '')
     marked_answers = re.findall(
         r'(?:####|(?:Final\s+)?Answer\s*:)\s*([-+]?\d+(?:\.\d+)?)', text, re.I,
@@ -119,11 +121,11 @@ def build_belebele_prompt(row):
     from src.prompts import instruction_prompt
 
     options = '\n'.join(
-        f'{index}. {row["mc_answer" + str(index)]}'
-        for index in range(1, 5)
+        f'{letter}. {row["mc_answer" + str(index)]}'
+        for index, letter in enumerate('ABCD', 1)
     )
     return instruction_prompt(
-        'Read the passage and answer the question. Answer with only 1, 2, 3, or 4.',
+        'Read the passage and answer the question. Answer with only A, B, C, or D.',
         f'{row["flores_passage"]}\n\n{row["question"]}\n{options}',
     )
 

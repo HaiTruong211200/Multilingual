@@ -45,6 +45,51 @@ class TinyModel(torch.nn.Module):
 
 
 class TwoStreamTests(unittest.TestCase):
+    def test_build_loads_sft_and_samples_before_tokenization(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        import src.train as training
+        from datasets import DatasetDict
+
+        alignment = Dataset.from_dict(dict(
+            kind=[1]*16, source_lang=['en']*16, target_lang=['vi']*8+['zh']*8,
+        ))
+        instruction = Dataset.from_dict(dict(
+            kind=[2]*24, language=['vi']*12+['zh']*12, dataset_name=['globalmgsm']*24,
+        ))
+        events = []
+        with patch('sys.argv', ['train', '--stage', 'alignment', '--model_name_or_path', 'test',
+                                '--output_dir', 'unused', '--stage1_data_mode', 'parallel_instruction',
+                                '--loss_schedule', 'alternate_microbatch_then_sft',
+                                '--batch_size', '2', '--gradient_accumulation_steps', '1']):
+            args = training.parse_args()
+        args.data_seed = 42
+        def load_sft(*a, **k):
+            events.append('sft')
+            return DatasetDict(train=instruction, validation=instruction.select(range(2)))
+        def load_parallel(*a, **k):
+            events.append('parallel')
+            return DatasetDict(train=alignment, validation=alignment.select(range(2)))
+        def tokenize(data, *a):
+            events.append(('tokenize', len(data['train'])))
+            self.assertEqual(list(data), ['train'])
+            return data
+        def load_model(*a, **k):
+            events.append('model')
+            return SimpleNamespace(lm=object())
+        with patch.object(training, 'load_instruction_dataset', side_effect=load_sft), \
+             patch.object(training, 'load_parallel_dataset', side_effect=load_parallel), \
+             patch.object(training, 'prepare_alignment_dataset', side_effect=tokenize), \
+             patch.object(training, 'MultilingualAlignmentModel', side_effect=load_model), \
+             patch.object(training, 'apply_lora', side_effect=lambda model, args: model), \
+             patch.dict('os.environ', {'WORLD_SIZE': '1'}), \
+             self.assertLogs('multilingual_training', level='INFO') as logs:
+            data, _, _ = training.build_stage(args, object())
+        self.assertEqual(events, ['sft', 'parallel', ('tokenize', 12), 'model'])
+        self.assertEqual(len(data['train'].instruction), 24)
+        self.assertTrue(any('Loading SFT FIRST' in line for line in logs.output))
+        self.assertTrue(any('Sampling complete BEFORE tokenization' in line for line in logs.output))
+
     def test_curriculum_trainer_crosses_phase_boundary(self):
         alignment = Dataset.from_dict(dict(
             kind=[1]*16, source_lang=['en']*16, target_lang=['vi']*8+['zh']*8,

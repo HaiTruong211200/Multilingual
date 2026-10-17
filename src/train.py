@@ -6,8 +6,9 @@ import logging
 import math
 import os
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 import torch
+from datasets import DatasetDict
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
@@ -497,15 +498,53 @@ def load_causal_lm(model_name_or_path: str, trust_remote_code: bool = False):
 
 def build_stage(args, tokenizer):
     if args.stage == "alignment":
+        two_stream = args.stage1_data_mode == "parallel_instruction"
+        instruction = train = None
+        if two_stream:
+            if args.loss_schedule == "joint" or args.training_mode != "finetune":
+                raise ValueError("parallel_instruction requires alternating loss_schedule and training_mode=finetune")
+            LOGGER.info("[two-stream] Loading SFT FIRST | sources=%s | languages=%s | GlobalMGSM=%s | XLSum=%s | Bactrian=%s",
+                        args.instruction_datasets, args.languages, args.globalmgsm_dir,
+                        args.xlsum_dir, args.bactrian_dir)
+            instruction = load_instruction_dataset(
+                args.xlsum_dir, args.bactrian_dir, args.languages,
+                args.bactrian_validation_ratio, args.seed,
+                instruction_datasets=args.instruction_datasets,
+                globalmgsm_dir=args.globalmgsm_dir,
+                globalmgsm_validation_ratio=args.globalmgsm_validation_ratio,
+            )
+            LOGGER.info("[two-stream] SFT loaded | train=%d | validation=%d | languages=%s | datasets=%s",
+                        len(instruction['train']), len(instruction['validation']),
+                        dict(Counter(instruction['train']['language'])),
+                        dict(Counter(instruction['train']['dataset_name'])))
+        LOGGER.info("Loading parallel data | root=%s | pairs=%s | direction=%s",
+                    args.data_dir, args.language_pairs, args.direction)
         dataset = load_parallel_dataset(
             args.data_dir, args.language_pairs, args.direction,
             args.train_file, args.validation_file,
         )
+        if two_stream:
+            train = PairedObjectiveDataset(
+                dataset['train'], instruction['train'], args.stage1_samples_per_stream, args.data_seed,
+                balance_pairs=args.stage1_balance_pairs,
+                sampling_order=args.stage1_sampling_order,
+                sft_multiplier=2 if args.loss_schedule == 'alternate_microbatch_then_sft' else 1,
+                batch_quantum=(
+                    args.batch_size * int(os.environ.get('WORLD_SIZE', max(torch.cuda.device_count(), 1)))
+                    * args.gradient_accumulation_steps
+                ) if args.loss_schedule == 'alternate_microbatch_then_sft' else 1,
+            )
+            LOGGER.info("[two-stream] Sampling complete BEFORE tokenization | alignment=%d | SFT=%d | SFT languages=%s",
+                        len(train.alignment), len(train.instruction), dict(Counter(train.instruction['language'])))
+            # No tokenization of discarded train rows or unused MT validation.
+            dataset = DatasetDict(train=train.alignment)
         calibration_train = dataset["train"]
         dataset = prepare_alignment_dataset(
             dataset, tokenizer, args.prompt_format, args.enable_thinking,
             args.training_mode,
         )
+        if two_stream:
+            train.alignment = dataset['train']
         model = MultilingualAlignmentModel(
             args.model_name_or_path,
             contrastive_weight=args.contrastive_weight,
@@ -559,26 +598,7 @@ def build_stage(args, tokenizer):
             LOGGER.info("OT whitening fitted | method=%s | retained_rank=%d | LEACE=False",
                         args.ot_whitening_method, model.ot_whitening.shape[1])
         collator = MultilingualDataCollator(tokenizer)
-        if args.stage1_data_mode == "parallel_instruction":
-            if args.loss_schedule == "joint" or args.training_mode != "finetune":
-                raise ValueError("parallel_instruction requires alternating loss_schedule and training_mode=finetune")
-            instruction = load_instruction_dataset(
-                args.xlsum_dir, args.bactrian_dir, args.languages,
-                args.bactrian_validation_ratio, args.seed,
-                instruction_datasets=args.instruction_datasets,
-                globalmgsm_dir=args.globalmgsm_dir,
-                globalmgsm_validation_ratio=args.globalmgsm_validation_ratio,
-            )
-            train = PairedObjectiveDataset(
-                dataset['train'], instruction['train'], args.stage1_samples_per_stream, args.data_seed,
-                balance_pairs=args.stage1_balance_pairs,
-                sampling_order=args.stage1_sampling_order,
-                sft_multiplier=2 if args.loss_schedule == 'alternate_microbatch_then_sft' else 1,
-                batch_quantum=(
-                    args.batch_size * int(os.environ.get('WORLD_SIZE', max(torch.cuda.device_count(), 1)))
-                    * args.gradient_accumulation_steps
-                ) if args.loss_schedule == 'alternate_microbatch_then_sft' else 1,
-            )
+        if two_stream:
             instruction_collator = InstructionDataCollator(
                 tokenizer, args.max_length, args.prompt_format, args.enable_thinking, 'finetune',
             )
@@ -632,9 +652,12 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
     )
     set_seed(args.seed)
     LOGGER.info("Building stage=%s", args.stage)
+    LOGGER.info("Training entrypoint=%s | stage1_data_mode=%s | sampling_order=%s | loss_schedule=%s",
+                Path(__file__).resolve(), args.stage1_data_mode, args.stage1_sampling_order, args.loss_schedule)
     LOGGER.info("Model/checkpoint=%s | output=%s", args.model_name_or_path, args.output_dir)
     LOGGER.info(
         "Prompt format=%s | thinking=%s | training_mode=%s",

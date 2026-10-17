@@ -12,7 +12,7 @@ def rescore_belebele(input_dir, *, languages=None, output_dir=None):
     """Save rescored copies; numeric first-line answers take precedence.
 
     Original predictions and input metrics are never overwritten. Letter answers
-    remain invalid. Gold is used only for scoring, never answer extraction.
+    are mapped A->1 through D->4. Gold is used only for scoring, never extraction.
     """
     root = Path(input_dir)
     destination = Path(output_dir) if output_dir else root / 'reparsed'
@@ -65,7 +65,7 @@ def rescore_belebele(input_dir, *, languages=None, output_dir=None):
             **source_metrics.get(('belebele', language), {}),
             'task': 'belebele', 'language': language, 'samples': count,
             'correct': correct, 'accuracy': correct / count, 'invalid': invalid,
-            'parser': 'numeric-first-response-v2', 'source_file': str(path),
+            'parser': 'letter-or-numeric-first-response-v3', 'source_file': str(path),
         }
         metrics.append(metric)
         comparison.append({

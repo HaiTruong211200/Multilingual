@@ -135,4 +135,7 @@ elif [[ "$PRECISION" != "fp32" ]]; then
   exit 2
 fi
 
-python "${ARGS[@]}"
+printf '[Stage 1] data_mode=%s sampling_order=%s loss_schedule=%s instruction_datasets=%s\n' \
+  "${STAGE1_DATA_MODE:-same_data}" "${STAGE1_SAMPLING_ORDER:-sft_first}" \
+  "${LOSS_SCHEDULE:-joint}" "${INSTRUCTION_DATASETS:-xlsum,bactrian}"
+python -u "${ARGS[@]}"
