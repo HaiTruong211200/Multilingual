@@ -3,12 +3,33 @@
 from typing import Any
 
 
+def inspect_stage1_data(*args: Any, **kwargs: Any):
+    from .inspect_stage1_data import inspect_stage1_data as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def rescore_belebele(*args: Any, **kwargs: Any):
+    from .rescore_benchmarks import rescore_belebele as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def display_benchmark_metrics(*args: Any, **kwargs: Any):
+    from .instruction_benchmarks import display_benchmark_metrics as implementation
+
+    return implementation(*args, **kwargs)
+
+
 def run_instruction_benchmarks(*args: Any, **kwargs: Any):
     from .instruction_benchmarks import run_instruction_benchmarks as implementation
 
     return implementation(*args, **kwargs)
 
 __all__ = [
+    "inspect_stage1_data",
+    "rescore_belebele",
+    "display_benchmark_metrics",
     "run_instruction_benchmarks",
     "evaluate_folder_sentence_bleu",
     "build_embeddings_dict",

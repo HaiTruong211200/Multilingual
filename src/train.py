@@ -16,6 +16,7 @@ from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dic
 from .collator import InstructionDataCollator, MultilingualDataCollator
 from .model import MultilingualAlignmentModel
 from .sampler import LanguagePairSampler
+from .two_stream import PairedObjectiveDataset, RepeatObjectiveBatchSampler, ObjectiveStreamCollator
 from .ot_calibration import calibrate_covariance
 from .ot_distance import load_whitening
 from .prepare_data import (
@@ -43,6 +44,7 @@ class ComponentLoggingTrainer(Trainer):
         stage: str,
         batch_by_language_pair: bool = False,
         loss_schedule: str = "joint",
+        stage1_data_mode: str = "same_data",
         sinkhorn_epsilon_schedule: str = "constant",
         sinkhorn_epsilon_end: float = 0.01,
         **kwargs,
@@ -50,6 +52,9 @@ class ComponentLoggingTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.stage = stage
         self.loss_schedule = loss_schedule
+        self.stage1_data_mode = stage1_data_mode
+        if stage1_data_mode == "parallel_instruction" and (stage != "alignment" or loss_schedule == "joint"):
+            raise ValueError("parallel_instruction requires Stage 1 and an alternating loss schedule")
         self._microbatch_index = 0
         self._active_objective = "joint"
         if loss_schedule != "joint":
@@ -75,6 +80,26 @@ class ComponentLoggingTrainer(Trainer):
         self._counts = {"train": 0, "eval": 0}
 
     def _get_train_sampler(self, train_dataset=None):
+        dataset = self.train_dataset if train_dataset is None else train_dataset
+        if self.stage1_data_mode == "parallel_instruction":
+            if self.accelerator.split_batches:
+                raise ValueError("Two-stream training requires split_batches=False")
+            alignment = dataset.alignment
+            if not self.batch_by_language_pair:
+                # Use a single artificial group for ordinary shuffled batches.
+                alignment = alignment.remove_columns(["source_lang", "target_lang"])
+                alignment = alignment.add_column("source_lang", ["all"] * len(alignment))
+                alignment = alignment.add_column("target_lang", ["all"] * len(alignment))
+            base = LanguagePairSampler(
+                alignment, self._train_batch_size, self.accelerator.num_processes,
+                self.args.data_seed if self.args.data_seed is not None else self.args.seed,
+            )
+            sampler = RepeatObjectiveBatchSampler(base, base.global_batch_size)
+            if len(sampler) == 0:
+                raise ValueError("Not enough parallel/instruction samples for one complete global batch")
+            LOGGER.info("Two streams | selected_per_stream=%d | usable_per_stream=%d | pair_grouping=%s",
+                        len(dataset), len(base), self.batch_by_language_pair)
+            return sampler
         if not self.batch_by_language_pair:
             if train_dataset is None:
                 return super()._get_train_sampler()
@@ -126,6 +151,10 @@ class ComponentLoggingTrainer(Trainer):
             self._active_objective = (
                 "sft" if sft_only or self._microbatch_index % 2 else "alignment"
             )
+        if self.stage1_data_mode == "parallel_instruction":
+            # Choose data and objective together; never apply alignment to SFT rows.
+            key = 'alignment_batch' if self._active_objective == 'alignment' else 'sft_batch'
+            inputs = inputs[key]
         try:
             result = super().training_step(model, inputs, num_items_in_batch)
             self._microbatch_index += 1
@@ -155,6 +184,8 @@ class ComponentLoggingTrainer(Trainer):
         # and therefore the value actually sent into backward.
         self._sums[mode]["trainer_loss"] += float(loss.detach().float().mean())
         if self.stage == "alignment":
+            if outputs.get("ntp_loss") is None:
+                self._sums[mode]["ntp_loss"] += float(loss.detach().float().mean())
             for key in self.COMPONENT_KEYS:
                 value = outputs.get(key)
                 if value is not None:
@@ -268,6 +299,13 @@ class ComponentLoggingTrainer(Trainer):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True, choices=["alignment", "instruction"])
+    parser.add_argument("--stage1_data_mode", choices=["same_data", "parallel_instruction"], default="same_data")
+    parser.add_argument("--stage1_sampling_order", choices=["sft_first", "joint_limit"], default="sft_first",
+                        help="Two-stream sampling: choose SFT budget first, or cap both sources jointly")
+    parser.add_argument("--stage1_balance_pairs", action=argparse.BooleanOptionalAction, default=True,
+                        help="Undersample each directed alignment pair equally in two-stream mode")
+    parser.add_argument("--stage1_samples_per_stream", type=int, default=None,
+                        help="Samples per stream; unset uses all SFT train in sft_first mode")
     parser.add_argument(
         "--loss_schedule", default="joint",
         choices=["joint", "alternate_microbatch", "alternate_microbatch_then_sft"],
@@ -508,6 +546,29 @@ def build_stage(args, tokenizer):
             LOGGER.info("OT whitening fitted | method=%s | retained_rank=%d | LEACE=False",
                         args.ot_whitening_method, model.ot_whitening.shape[1])
         collator = MultilingualDataCollator(tokenizer)
+        if args.stage1_data_mode == "parallel_instruction":
+            if args.loss_schedule == "joint" or args.training_mode != "finetune":
+                raise ValueError("parallel_instruction requires alternating loss_schedule and training_mode=finetune")
+            instruction = load_instruction_dataset(
+                args.xlsum_dir, args.bactrian_dir, args.languages,
+                args.bactrian_validation_ratio, args.seed,
+                instruction_datasets=args.instruction_datasets,
+                globalmgsm_dir=args.globalmgsm_dir,
+                globalmgsm_validation_ratio=args.globalmgsm_validation_ratio,
+            )
+            train = PairedObjectiveDataset(
+                dataset['train'], instruction['train'], args.stage1_samples_per_stream, args.data_seed,
+                balance_pairs=args.stage1_balance_pairs,
+                sampling_order=args.stage1_sampling_order,
+            )
+            instruction_collator = InstructionDataCollator(
+                tokenizer, args.max_length, args.prompt_format, args.enable_thinking, 'finetune',
+            )
+            collator = ObjectiveStreamCollator(collator, instruction_collator)
+            # Best-checkpoint selection uses held-out instruction NTP loss.
+            dataset = {'train': train, 'validation': instruction['validation']}
+            LOGGER.info("Stage 1 two-stream | sampling_order=%s | parallel=%d | instruction=%d | instruction_sources=%s | eval=instruction NTP",
+                        args.stage1_sampling_order, len(train.alignment), len(train.instruction), args.instruction_datasets)
         return dataset, model, collator
 
     dataset = load_instruction_dataset(
@@ -702,6 +763,7 @@ def main() -> None:
         data_collator=collator,
         stage=args.stage,
         loss_schedule=args.loss_schedule,
+        stage1_data_mode=args.stage1_data_mode,
         batch_by_language_pair=args.batch_by_language_pair,
         sinkhorn_epsilon_schedule=args.sinkhorn_epsilon_schedule,
         sinkhorn_epsilon_end=args.sinkhorn_epsilon_end,

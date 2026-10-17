@@ -15,6 +15,16 @@ ARGS=(
   -m src.train
   --stage alignment
   --loss_schedule "${LOSS_SCHEDULE:-joint}"
+  --stage1_data_mode "${STAGE1_DATA_MODE:-same_data}"
+  --stage1_sampling_order "${STAGE1_SAMPLING_ORDER:-sft_first}"
+  --instruction_datasets "${INSTRUCTION_DATASETS:-xlsum,bactrian}"
+  --xlsum_dir "${XLSUM_DIR:-data/XLSum/XLSum}"
+  --bactrian_dir "${BACTRIAN_DIR:-data/Bactrian-Multilingual_Instruction}"
+  --globalmgsm_dir "${GLOBALMGSM_DIR:-data/GlobalMGSM}"
+  --globalmgsm_validation_ratio "${GLOBALMGSM_VALIDATION_RATIO:-0.01}"
+  --bactrian_validation_ratio "${BACTRIAN_VALIDATION_RATIO:-0.01}"
+  --languages "${LANGUAGES:-en,km,my,th,vi}"
+  --max_length "${MAX_LENGTH:-1024}"
   --model_name_or_path "$MODEL_NAME_OR_PATH"
   --data_dir "$DATA_DIR"
   --language_pairs "${LANGUAGE_PAIRS:-all}"
@@ -88,6 +98,14 @@ fi
 
 if [[ "${BATCH_BY_LANGUAGE_PAIR:-false}" == "true" ]]; then
   ARGS+=(--batch_by_language_pair)
+fi
+if [[ -n "${STAGE1_SAMPLES_PER_STREAM:-}" ]]; then
+  ARGS+=(--stage1_samples_per_stream "$STAGE1_SAMPLES_PER_STREAM")
+fi
+if [[ "${STAGE1_BALANCE_PAIRS:-true}" == "true" ]]; then
+  ARGS+=(--stage1_balance_pairs)
+else
+  ARGS+=(--no-stage1_balance_pairs)
 fi
 
 if [[ -n "${OT_COVARIANCE_PATH:-}" ]]; then

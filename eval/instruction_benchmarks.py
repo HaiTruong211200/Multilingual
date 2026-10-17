@@ -12,6 +12,14 @@ def parse_answer(text, task):
     """Parse an explicit final answer; ambiguous choice outputs remain invalid."""
     text = text.split('</think>')[-1].strip()
     if task == 'belebele':
+        # The first response is authoritative: models sometimes continue with
+        # new Alpaca sections or additional answers after already answering.
+        # Never use numbers from those generated sections or explanations.
+        first_line = text.splitlines()[0].strip() if text else ''
+        match = re.fullmatch(r'([1-4])[.)]?', first_line)
+        if match:
+            return match.group(1)
+        text = re.split(r'(?m)^\s*#{3,}', text, maxsplit=1)[0].strip()
         match = re.fullmatch(r'\s*([1-4])[.)]?\s*', text)
         if not match:
             match = re.search(r'(?:Answer|Final answer)\s*:\s*([1-4])\b', text, re.I)
@@ -219,6 +227,7 @@ def run_instruction_benchmarks(
                             'gold': gold, 'is_correct': pred is not None and pred == gold})
         count = len(records)
         metrics.append(dict(task=task, language=config, samples=count,
+                            correct=sum(r['is_correct'] for r in records),
                             accuracy=sum(r['is_correct'] for r in records) / count if count else None,
                             invalid=sum(r['prediction'] is None for r in records),
                             protocol='zero-shot generation', model=model_path))
@@ -231,7 +240,39 @@ def run_instruction_benchmarks(
                 handle.write(json.dumps(row, ensure_ascii=False) + '\n')
     with (root / 'metrics.json').open('w', encoding='utf-8') as handle:
         json.dump(metrics, handle, ensure_ascii=False, indent=2)
-    return {'metrics': metrics, 'output_dir': root}
+    metrics_table = display_benchmark_metrics(metrics)
+    return {'metrics': metrics, 'metrics_table': metrics_table, 'output_dir': root}
+
+
+def display_benchmark_metrics(metrics):
+    """Show a notebook table (or terminal text) without rerunning inference."""
+    import pandas as pd
+
+    rows = []
+    for metric in metrics:
+        accuracy = metric.get('accuracy')
+        rows.append({
+            'Benchmark': metric['task'],
+            'Language': metric['language'],
+            'Samples': metric['samples'],
+            'Correct': metric.get('correct', round(accuracy * metric['samples']) if accuracy is not None else None),
+            'Accuracy (%)': accuracy * 100 if accuracy is not None else None,
+            'Invalid': metric['invalid'],
+        })
+    table = pd.DataFrame(rows, columns=[
+        'Benchmark', 'Language', 'Samples', 'Correct', 'Accuracy (%)', 'Invalid',
+    ])
+    try:
+        from IPython import get_ipython
+        from IPython.display import display
+        notebook = get_ipython() is not None and getattr(get_ipython(), 'kernel', None) is not None
+    except ImportError:
+        notebook = False
+    if notebook:
+        display(table.style.format({'Accuracy (%)': '{:.2f}'}, na_rep='—'))
+    else:
+        print(table.to_string(index=False, float_format=lambda value: f'{value:.2f}'))
+    return table
 
 
 if __name__ == '__main__':
@@ -248,4 +289,4 @@ if __name__ == '__main__':
     parser.add_argument('--use_chat_template', action='store_true')
     parser.add_argument('--enable_thinking', action='store_true')
     parser.add_argument('--trust_remote_code', action='store_true')
-    print(run_instruction_benchmarks(**vars(parser.parse_args())))
+    run_instruction_benchmarks(**vars(parser.parse_args()))
